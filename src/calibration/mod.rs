@@ -217,6 +217,16 @@ impl CrossDeviceCalibrator {
             .collect()
     }
 
+    /// Reference device calibration profile.
+    pub fn reference(&self) -> &CalibrationProfile {
+        &self.reference
+    }
+
+    /// Target device calibration profile.
+    pub fn target(&self) -> &CalibrationProfile {
+        &self.target
+    }
+
     /// Alignment quality score (0.0-1.0).
     pub fn alignment_quality(&self) -> f64 {
         let mean_gain = self.gain_map.iter().sum::<f64>() / self.gain_map.len() as f64;

@@ -335,7 +335,7 @@ mod tests {
         let b_mean = vec![1.1, 2.1];
         let a_std = vec![0.1, 0.1];
         let b_std = vec![0.1, 0.1];
-        let (warn, msg) = similarity_warning(&a_mean, &b_mean, &a_std, &b_std, 2.0);
+        let (warn, _msg) = similarity_warning(&a_mean, &b_mean, &a_std, &b_std, 2.0);
         assert!(warn, "Should warn for similar substances");
     }
 }

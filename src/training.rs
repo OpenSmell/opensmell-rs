@@ -1453,7 +1453,6 @@ mod tests {
         let channels = 6;
         let samples: Vec<Vec<f64>> = (0..n)
             .map(|i| {
-                let t = i as f64 / 10.0;
                 (0..channels)
                     .map(|c| {
                         let tau = 2.5 + c as f64 * 0.4;

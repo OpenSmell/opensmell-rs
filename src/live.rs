@@ -410,7 +410,7 @@ mod tests {
         let mut live = LiveClassifier::new();
         live.load(model, None);
         // window*2 = 40 samples: no trim needed at 40, trim only > 40.
-        for i in 0..41 {
+        for _i in 0..41 {
             let _ = live.add_sample(&[100.0, 0.0, 0.0]);
         }
         assert_eq!(live.buffer_len(), live.window_size());

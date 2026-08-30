@@ -255,22 +255,12 @@ fn normalized_series(values: &[f64], r0: f64) -> Vec<f64> {
 
 struct ChannelStats {
     id: String,
-    min: f64,
-    max: f64,
-    mean: f64,
-    std: f64,
-    r0: f64,
-    cv: f64,
     dead: bool,
     span: f64,
-    clipped: usize,
-    non_finite: usize,
 }
 
 fn channel_stats(values: &[f64], r0: f64) -> ChannelStats {
     let finite: Vec<f64> = values.iter().copied().filter(|v| is_finite(*v)).collect();
-    let non_finite = values.len() - finite.len();
-    let m = mean(&finite);
     let sd = std(&finite);
     let cv = if r0 > 0.0 { sd / r0 } else { f64::INFINITY };
     let lo = if finite.is_empty() { f64::NAN } else { finite.iter().copied().fold(f64::INFINITY, f64::min) };
@@ -278,16 +268,8 @@ fn channel_stats(values: &[f64], r0: f64) -> ChannelStats {
     let span = if finite.is_empty() { f64::NAN } else { hi - lo };
     ChannelStats {
         id: String::new(),
-        min: lo,
-        max: hi,
-        mean: m,
-        std: sd,
-        r0,
-        cv,
         dead: cv < DEAD_CV_THRESHOLD,
         span,
-        clipped: 0,
-        non_finite,
     }
 }
 
@@ -385,7 +367,6 @@ pub fn compute_quality(
         } else {
             values.iter().filter(|v| **v <= 0.0).count()
         };
-        s.clipped = clipped;
         sat_scores.push(if values.is_empty() {
             100.0
         } else {

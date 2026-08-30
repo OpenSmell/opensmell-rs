@@ -288,7 +288,6 @@ struct DeviceAgnostic {
     r0: f64,
     peak_idx: usize,
     is_dead: bool,
-    std_ratio: f64,
 }
 
 impl DeviceAgnostic {
@@ -303,7 +302,6 @@ impl DeviceAgnostic {
             r0: 0.0,
             peak_idx: 0,
             is_dead: true,
-            std_ratio: 0.0,
         }
     }
 }
@@ -348,7 +346,6 @@ fn compute_channel_device_agnostic(series: &[f64], r0_samples: usize, sr: f64, r
             r0,
             peak_idx: 0,
             is_dead: true,
-            std_ratio,
         };
     }
 
@@ -421,7 +418,6 @@ fn compute_channel_device_agnostic(series: &[f64], r0_samples: usize, sr: f64, r
         r0,
         peak_idx,
         is_dead: false,
-        std_ratio,
     }
 }
 
