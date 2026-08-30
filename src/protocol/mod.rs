@@ -1,0 +1,361 @@
+use serde::{Deserialize, Serialize};
+use crate::{Result, OpenSmellError};
+
+/// OSM protocol message types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OsmMessage {
+    /// Sensor data: OSM,<adc0>,<adc1>,...,<adcN>
+    Data { channels: Vec<f64>, timestamp: f64 },
+    /// Device info: INFO,<device_id>,<firmware_version>,<n_sensors>
+    Info { device_id: String, firmware_version: String, n_sensors: usize },
+    /// Calibration request: CAL,<channel>,<r0_value>
+    Calibration { channel: usize, r0_value: f64 },
+    /// Error message: ERR,<error_code>,<message>
+    Error { code: i32, message: String },
+    /// Heartbeat: PING
+    Ping,
+    /// Unknown line.
+    Unknown(String),
+}
+
+/// OSM protocol parser.
+/// Works with any MCU (ESP32, Arduino, STM32, RPi) that sends CSV-like data.
+pub struct OsmProtocol {
+    /// Expected number of channels (0 = auto-detect).
+    expected_channels: usize,
+    /// Timestamp offset (for syncing device time with host time).
+    timestamp_offset: f64,
+}
+
+impl OsmProtocol {
+    pub fn new(expected_channels: usize) -> Self {
+        Self {
+            expected_channels,
+            timestamp_offset: 0.0,
+        }
+    }
+
+    /// Parse a single line from the device.
+    pub fn parse_line(&self, line: &str, host_timestamp: f64) -> Result<OsmMessage> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(OsmMessage::Unknown(line.to_string()));
+        }
+
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.is_empty() {
+            return Ok(OsmMessage::Unknown(line.to_string()));
+        }
+
+        match parts[0].to_uppercase().as_str() {
+            "OSM" => self.parse_data(&parts[1..], host_timestamp),
+            "INFO" => self.parse_info(&parts[1..]),
+            "CAL" => self.parse_calibration(&parts[1..]),
+            "ERR" => self.parse_error(&parts[1..]),
+            "PING" => Ok(OsmMessage::Ping),
+            _ => Ok(OsmMessage::Unknown(line.to_string())),
+        }
+    }
+
+    fn parse_data(&self, parts: &[&str], host_timestamp: f64) -> Result<OsmMessage> {
+        let channels: Result<Vec<f64>> = parts
+            .iter()
+            .map(|p| {
+                p.trim().parse::<f64>()
+                    .map_err(|_| OpenSmellError::FeatureExtraction(
+                        format!("Invalid float: {}", p)
+                    ))
+            })
+            .collect();
+        let channels = channels?;
+
+        // Auto-pad or trim to expected channel count
+        let channels = if self.expected_channels > 0 {
+            let mut ch = channels;
+            while ch.len() < self.expected_channels {
+                ch.push(0.0);
+            }
+            ch.truncate(self.expected_channels);
+            ch
+        } else {
+            channels
+        };
+
+        Ok(OsmMessage::Data {
+            channels,
+            timestamp: host_timestamp + self.timestamp_offset,
+        })
+    }
+
+    fn parse_info(&self, parts: &[&str]) -> Result<OsmMessage> {
+        if parts.len() < 3 {
+            return Err(OpenSmellError::FeatureExtraction("INFO message too short".to_string()));
+        }
+        Ok(OsmMessage::Info {
+            device_id: parts[0].trim().to_string(),
+            firmware_version: parts[1].trim().to_string(),
+            n_sensors: parts[2].trim().parse().unwrap_or(0),
+        })
+    }
+
+    fn parse_calibration(&self, parts: &[&str]) -> Result<OsmMessage> {
+        if parts.len() < 2 {
+            return Err(OpenSmellError::FeatureExtraction("CAL message too short".to_string()));
+        }
+        Ok(OsmMessage::Calibration {
+            channel: parts[0].trim().parse().unwrap_or(0),
+            r0_value: parts[1].trim().parse().unwrap_or(0.0),
+        })
+    }
+
+    fn parse_error(&self, parts: &[&str]) -> Result<OsmMessage> {
+        if parts.len() < 2 {
+            return Ok(OsmMessage::Error { code: -1, message: "Unknown error".to_string() });
+        }
+        Ok(OsmMessage::Error {
+            code: parts[0].trim().parse().unwrap_or(-1),
+            message: parts[1..].join(","),
+        })
+    }
+}
+
+/// Generate Arduino firmware sketch for ESP32 with configurable sensor pins.
+///
+/// The generated firmware:
+/// - connects to a WiFi network (or falls back to SoftAP mode),
+/// - advertises an mDNS service `_osmograph._tcp` on TCP port 8080,
+/// - runs a multi-client TCP server speaking the OSM protocol,
+/// - streams `OSM` readings at 10 Hz over serial and to all clients,
+/// - responds to `PING` (with `PONG`) and `CAL` (re-baseline),
+/// - sends `INFO` on client connect,
+/// - collects a baseline (`r0` per channel) at boot.
+pub fn generate_arduino_sketch(
+    sensor_pins: &[u8],
+    wifi_ssid: &str,
+    wifi_password: &str,
+) -> String {
+    let pins_str = sensor_pins.iter()
+        .map(|p| format!("  {}", p))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    let n_sensors = sensor_pins.len();
+
+    format!(r#"
+// OpenSmell ESP32 Firmware
+// Generated by opensmell-rs protocol::generate_arduino_sketch
+// Sensor pins: {sensor_pins:?}
+
+#include <WiFi.h>
+#include <WiFiServer.h>
+#include <mDNS.h>
+#include <string.h>
+
+#define FW_VERSION "1.1.0"
+#define OSM_SERVICE "_osmograph"
+#define OSM_TCP_PORT 8080
+#define SAMPLE_INTERVAL_MS 100          // 10 Hz per channel
+#define BASELINE_SECONDS 30
+#define BASELINE_SAMPLES (BASELINE_SECONDS * 10)
+#define MAX_CLIENTS 4
+#define AP_SSID_PREFIX "Osmograph-"
+
+// WiFi credentials (empty SSID => SoftAP mode)
+const char* WIFI_SSID = "{wifi_ssid}";
+const char* WIFI_PASS = "{wifi_password}";
+
+// Sensor configuration
+const int SENSOR_PINS[] = {{
+{pins_str}
+}};
+const int N_SENSORS = {n_sensors};
+
+WiFiServer server(OSM_TCP_PORT);
+WiFiClient clients[MAX_CLIENTS];
+
+// Baseline (R0) values, updated during calibration
+float r0[N_SENSORS] = {{0}};
+bool calibrated = false;
+uint32_t lastSampleMs = 0;
+
+void logLine(const String& s) {{
+    Serial.println(s);
+}}
+
+String deviceId() {{
+    uint32_t upper = (uint32_t)(ESP.getEfuseMac() >> 32);
+    uint32_t lower = (uint32_t)ESP.getEfuseMac();
+    char id[36];
+    snprintf(id, sizeof(id), "opensmell-%08X%08X", upper, lower);
+    return String(id);
+}}
+
+float readVoltage(int pin) {{
+    return (analogRead(pin) / (float)4095) * 3.3f;
+}}
+
+void sendToClients(const String& line) {{
+    for (int i = 0; i < MAX_CLIENTS; i++) {{
+        if (clients[i] && clients[i].connected()) {{
+            clients[i].println(line);
+        }}
+    }}
+}}
+
+void collectBaseline() {{
+    logLine("collectBaseline: sampling " + String(BASELINE_SAMPLES) + " points per channel");
+    double sum[N_SENSORS] = {{0}};
+    for (int s = 0; s < BASELINE_SAMPLES; s++) {{
+        for (int i = 0; i < N_SENSORS; i++) {{
+            sum[i] += readVoltage(SENSOR_PINS[i]);
+        }}
+        delay(SAMPLE_INTERVAL_MS);
+    }}
+    for (int i = 0; i < N_SENSORS; i++) {{
+        r0[i] = (float)(sum[i] / BASELINE_SAMPLES);
+    }}
+    calibrated = true;
+    logLine("Baseline complete; R0 stored per channel");
+}}
+
+void setupWifi() {{
+    if (strlen(WIFI_SSID) > 0) {{
+        logLine("Connecting to SSID " + String(WIFI_SSID));
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 40) {{
+            delay(500);
+            attempts++;
+        }}
+        if (WiFi.status() == WL_CONNECTED) {{
+            logLine("WiFi connected: " + WiFi.localIP().toString());
+        }} else {{
+            logLine("STA connect failed; switching to SoftAP");
+            WiFi.mode(WIFI_AP);
+            String ap = AP_SSID_PREFIX + String((uint32_t)(ESP.getEfuseMac() & 0xFFFF), HEX);
+            WiFi.softAP(ap.c_str(), "osmograph");
+            logLine("SoftAP started: " + ap);
+        }}
+    }} else {{
+        WiFi.mode(WIFI_AP);
+        String ap = AP_SSID_PREFIX + String((uint32_t)(ESP.getEfuseMac() & 0xFFFF), HEX);
+        WiFi.softAP(ap.c_str(), "osmograph");
+        logLine("SoftAP started: " + ap);
+    }}
+}}
+
+void setup() {{
+    Serial.begin(115200);
+
+    analogSetWidth(12);
+    analogSetAttenuation(ADC_11DB);
+    for (int i = 0; i < N_SENSORS; i++) {{
+        pinMode(SENSOR_PINS[i], INPUT);
+    }}
+
+    setupWifi();
+
+    if (!MDNS.begin("osmograph")) {{
+        logLine("mDNS init failed");
+    }} else {{
+        MDNS.addService("_osmograph", "tcp", OSM_TCP_PORT);
+        logLine("mDNS: osmograph.local advertises _osmograph._tcp:" + String(OSM_TCP_PORT));
+    }}
+
+    server.begin();
+    logLine("TCP server on port " + String(OSM_TCP_PORT));
+    logLine("Device " + deviceId() + " fw " + String(FW_VERSION) + " channels " + String(N_SENSORS));
+
+    logLine("Collecting baseline...");
+    collectBaseline();
+    logLine("Streaming ready");
+}}
+
+void serviceClients() {{
+    for (int i = 0; i < MAX_CLIENTS; i++) {{
+        if (!clients[i] || !clients[i].connected()) {{
+            clients[i] = WiFiClient();
+            continue;
+        }}
+        while (clients[i].available()) {{
+            String cmd = clients[i].readStringUntil('\n');
+            cmd.trim();
+            if (cmd == "PING") {{
+                clients[i].println("PONG");
+            }} else if (cmd.startsWith("CAL")) {{
+                collectBaseline();
+                clients[i].println("CAL,OK");
+            }}
+        }}
+    }}
+}}
+
+void loop() {{
+    WiFiClient newClient = server.available();
+    if (newClient) {{
+        for (int i = 0; i < MAX_CLIENTS; i++) {{
+            if (!clients[i]) {{
+                clients[i] = newClient;
+                logLine("Client connected (slot " + String(i) + ")");
+                clients[i].println("INFO," + deviceId() + "," + String(FW_VERSION) + "," + String(N_SENSORS));
+                break;
+            }}
+        }}
+    }}
+
+    serviceClients();
+
+    uint32_t now = millis();
+    if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {{
+        lastSampleMs = now;
+        String line = "OSM";
+        for (int i = 0; i < N_SENSORS; i++) {{
+            line += ",";
+            line += String(readVoltage(SENSOR_PINS[i]), 4);
+        }}
+        Serial.println(line);
+        sendToClients(line);
+    }}
+
+    yield();
+}}
+"#)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_osm_line() {
+        let protocol = OsmProtocol::new(3);
+        let msg = protocol.parse_line("OSM,1.234,2.345,3.456", 0.0).unwrap();
+        match msg {
+            OsmMessage::Data { channels, .. } => {
+                assert_eq!(channels.len(), 3);
+                assert!((channels[0] - 1.234).abs() < 0.001);
+            }
+            _ => panic!("Expected Data message"),
+        }
+    }
+
+    #[test]
+    fn test_generated_sketch_has_mdns_and_protocol() {
+        let sketch = generate_arduino_sketch(&[32, 33, 34, 35, 36, 39], "TestNet", "secret");
+        assert!(sketch.contains("MDNS.addService(\"_osmograph\", \"tcp\", OSM_TCP_PORT)"));
+        assert!(sketch.contains("MDNS.begin(\"osmograph\")"));
+        assert!(sketch.contains("WiFiServer server(OSM_TCP_PORT);"));
+        assert!(sketch.contains("\"TestNet\""));
+        assert!(sketch.contains("INFO,\" + deviceId() + \",\" + String(FW_VERSION)"));
+        assert!(sketch.contains("clients[i].println(\"PONG\")"));
+        assert!(sketch.contains("SAMPLE_INTERVAL_MS 100"));
+        assert!(sketch.contains("const int N_SENSORS = 6;"));
+    }
+
+    #[test]
+    fn test_generated_sketch_ap_fallback_when_ssid_empty() {
+        let sketch = generate_arduino_sketch(&[32, 33], "", "");
+        assert!(sketch.contains("const char* WIFI_SSID = \"\";"));
+        assert!(sketch.contains("WiFi.softAP(ap.c_str(), \"osmograph\")"));
+    }
+}
