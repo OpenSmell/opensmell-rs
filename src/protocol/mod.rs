@@ -265,6 +265,9 @@ void setup() {{
     server.begin();
     logLine("TCP server on port " + String(OSM_TCP_PORT));
     logLine("Device " + deviceId() + " fw " + String(FW_VERSION) + " channels " + String(N_SENSORS));
+    // Announce the channel layout on Serial too, so the desktop auto-detects
+    // the stream width the instant the board powers on (no manual rig picker).
+    logLine("INFO," + deviceId() + "," + String(FW_VERSION) + "," + String(N_SENSORS));
 
     logLine("Collecting baseline...");
     collectBaseline();

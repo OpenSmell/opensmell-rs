@@ -120,6 +120,8 @@ pub mod quality;
 pub mod training;
 
 pub mod live;
+
+pub mod smellability;
 pub use features::{FeatureGroup, extract_features, extract_window_features, feature_names};
 pub use anomaly::{AnomalyDetector, AnomalyScore, AnomalyMethod};
 pub use calibration::{Calibrator, CalibrationProfile, CrossDeviceCalibrator};
@@ -137,3 +139,13 @@ pub use training::{train_classifier, TrainOptions, TrainingReport, ClassifierMod
 pub use framework::{framework_window_features, compute_multi_exp_decay};
 pub use live::{LiveClassifier, LiveSnapshot, Prediction, ROLLING_WINDOW, LOCK_THRESHOLD,
                LOCK_CONSECUTIVE, UNKNOWN_THRESHOLD, UNKNOWN_CONSECUTIVE};
+pub use smellability::{
+    Chemical, ChemicalProperties, ChainOptions, ChainStep, ChainValue, ConstituentVerdict,
+    CrossCheck, DataSource, FeasibilityVerdict, IncidentFluxInput, Property, ResolvedEntityKind,
+    ResponseSpeed, SignalBand, SignalStrength, Verdict, VerdictConfidence,
+    delta_h_vap_trouton, diffusion_coefficient_fuller, incident_flux, incident_flux_proportional,
+    resolve_and_run, run_chemical_verdict, signal_band_label, signal_ratio_vs_ref, signal_score,
+    vapor_pressure_antoine, vapor_pressure_clausius_clapeyron, worst_verdict, AMBIENT_TEMP_C,
+    AMBIENT_TEMP_K, DEFAULT_DISTANCE_M, DEFAULT_SENSOR_COUNT, MOX_FLOOR_PPM, P_ATM,
+    REFERENCE_CHEMICAL_ID, R, N_A, max_substances, reference_by_id,
+};
