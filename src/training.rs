@@ -429,6 +429,9 @@ pub struct PairSimilarity {
 /// Honest model card: out-of-sample metrics and provenance, stored in the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCard {
+    /// Training algorithm used, e.g. `"logistic_regression"`. Recorded so a
+    /// model card never overstates what was actually fit.
+    pub algorithm: String,
     /// Out-of-sample LORO accuracy (windows aggregated over all leave-out folds).
     pub accuracy: f64,
     /// Mean of per-recording (leave-one-out) fold accuracies.
@@ -1357,6 +1360,7 @@ pub fn train_classifier(
         precision_recall(&classes, &confusion_counts);
 
     let model_card = ModelCard {
+        algorithm: "logistic_regression".to_string(),
         accuracy,
         loro_mean_accuracy: loro_mean,
         in_sample_accuracy: in_sample,
@@ -1742,6 +1746,7 @@ mod tests {
         ];
         let rep = train_classifier(&recs, "spices", &paradigm_opts()).unwrap();
         let card = ClassifierModel::from_json(&rep.model_json).unwrap().model_card;
+        assert_eq!(card.algorithm, "logistic_regression");
         assert!(card.accuracy > 0.0 && card.accuracy <= 1.0);
         assert!(card.loro_mean_accuracy > 0.0 && card.loro_mean_accuracy <= 1.0);
         assert!(card.per_class_precision.contains_key("garlic"));
