@@ -1,22 +1,22 @@
 [package]
 name = "opensmell"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["OpenSmell Contributors"]
+repository = "https://github.com/opensmell/opensmell"
 description = "MOX e-nose feature extraction, anomaly detection, and calibration engine"
 
 [dependencies]
-ndarray.workspace = true
-num-traits.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-csv.workspace = true
-chrono.workspace = true
-log.workspace = true
+ndarray = "0.16"
+num-traits = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+csv = "1"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
 
 [dev-dependencies]
-env_logger.workspace = true
+env_logger = "0.11"
 approx = "0.5"
