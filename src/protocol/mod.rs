@@ -1,6 +1,43 @@
 use serde::{Deserialize, Serialize};
 use crate::{Result, OpenSmellError};
 
+/// Semantic kind of a streamed channel. The default is a classic analog MOX
+/// cell; MEMS digital chips are I²C and should be treated as a raw index, env
+/// values come from DHT-style telemetry, and `Fan` is a control actuator.
+/// Kinds are declared by firmware with an `OSMK` line; absent that, everything
+/// is assumed `AnalogMox` (backwards-compatible with v1 CSV streams).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelKind {
+    AnalogMox,
+    MemsIndex,
+    EnvTemp,
+    EnvHum,
+    Fan,
+}
+
+impl ChannelKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChannelKind::AnalogMox => "analog_mox",
+            ChannelKind::MemsIndex => "mems_index",
+            ChannelKind::EnvTemp => "env_temp",
+            ChannelKind::EnvHum => "env_hum",
+            ChannelKind::Fan => "fan",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ChannelKind> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "analog" | "analog_mox" | "mox" | "mq" => Some(ChannelKind::AnalogMox),
+            "mems" | "mems_index" | "digital" => Some(ChannelKind::MemsIndex),
+            "temp" | "env_temp" | "temperature" => Some(ChannelKind::EnvTemp),
+            "hum" | "env_hum" | "humidity" => Some(ChannelKind::EnvHum),
+            "fan" | "rpm" => Some(ChannelKind::Fan),
+            _ => None,
+        }
+    }
+}
+
 /// OSM protocol message types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OsmMessage {
@@ -14,6 +51,11 @@ pub enum OsmMessage {
     Error { code: i32, message: String },
     /// Heartbeat: PING
     Ping,
+    /// Per-column channel kinds: OSMK,<kind0>,<kind1>,...,<kindN>
+    /// e.g. OSMK,analog,mems,env_temp,env_hum,fan
+    Kinds { kinds: Vec<ChannelKind> },
+    /// Environmental telemetry (DHT-style): ENV,<temp_C>,<hum_pct>
+    Env { temperature: f64, humidity: f64 },
     /// Unknown line.
     Unknown(String),
 }
@@ -49,12 +91,34 @@ impl OsmProtocol {
 
         match parts[0].to_uppercase().as_str() {
             "OSM" => self.parse_data(&parts[1..], host_timestamp),
+            "OSMK" => self.parse_kinds(&parts[1..]),
+            "ENV" => self.parse_env(&parts[1..]),
             "INFO" => self.parse_info(&parts[1..]),
             "CAL" => self.parse_calibration(&parts[1..]),
             "ERR" => self.parse_error(&parts[1..]),
             "PING" => Ok(OsmMessage::Ping),
             _ => Ok(OsmMessage::Unknown(line.to_string())),
         }
+    }
+
+    /// OSMK,<kind0>,...,<kindN> — a per-column kind declaration. Unknown tokens
+    /// fall back to `AnalogMox` (lenient) so a slightly-off declaration never
+    /// kills the stream; the desktop dataset stays honest regardless.
+    fn parse_kinds(&self, parts: &[&str]) -> Result<OsmMessage> {
+        let kinds: Vec<ChannelKind> = parts.iter()
+            .map(|p| ChannelKind::parse(p).unwrap_or(ChannelKind::AnalogMox))
+            .collect();
+        Ok(OsmMessage::Kinds { kinds })
+    }
+
+    /// ENV,<temp_C>,<hum_pct> — environmental telemetry.
+    fn parse_env(&self, parts: &[&str]) -> Result<OsmMessage> {
+        if parts.len() < 2 {
+            return Err(OpenSmellError::FeatureExtraction("ENV message too short".to_string()));
+        }
+        let temperature = parts[0].trim().parse::<f64>().unwrap_or(f64::NAN);
+        let humidity = parts[1].trim().parse::<f64>().unwrap_or(f64::NAN);
+        Ok(OsmMessage::Env { temperature, humidity })
     }
 
     fn parse_data(&self, parts: &[&str], host_timestamp: f64) -> Result<OsmMessage> {
@@ -340,6 +404,54 @@ mod tests {
             }
             _ => panic!("Expected Data message"),
         }
+    }
+
+    #[test]
+    fn test_parse_kinds_mixed_rig() {
+        let protocol = OsmProtocol::new(0);
+        match protocol.parse_line("OSMK,analog,mems,env_temp,env_hum,fan", 0.0).unwrap() {
+            OsmMessage::Kinds { kinds } => {
+                assert_eq!(kinds, vec![
+                    ChannelKind::AnalogMox,
+                    ChannelKind::MemsIndex,
+                    ChannelKind::EnvTemp,
+                    ChannelKind::EnvHum,
+                    ChannelKind::Fan,
+                ]);
+            }
+            _ => panic!("Expected Kinds message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_kinds_lenient_unknown_tokens() {
+        let protocol = OsmProtocol::new(0);
+        match protocol.parse_line("OSMK,analog,bogus,mems", 0.0).unwrap() {
+            OsmMessage::Kinds { kinds } => {
+                assert_eq!(kinds[0], ChannelKind::AnalogMox);
+                assert_eq!(kinds[1], ChannelKind::AnalogMox); // unknown → lenient default
+                assert_eq!(kinds[2], ChannelKind::MemsIndex);
+            }
+            _ => panic!("Expected Kinds message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_env_telemetry() {
+        let protocol = OsmProtocol::new(0);
+        match protocol.parse_line("ENV,24.5,52.0", 0.0).unwrap() {
+            OsmMessage::Env { temperature, humidity } => {
+                assert!((temperature - 24.5).abs() < 0.001);
+                assert!((humidity - 52.0).abs() < 0.001);
+            }
+            _ => panic!("Expected Env message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_env_too_short() {
+        let protocol = OsmProtocol::new(0);
+        assert!(protocol.parse_line("ENV,24.5", 0.0).is_err());
     }
 
     #[test]
