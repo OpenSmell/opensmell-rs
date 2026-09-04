@@ -489,7 +489,17 @@ pub struct FailSafeSystem {
     pub alert_level: u8,
     pub consecutive_anomalies: usize,
     pub consecutive_normal: usize,
+    /// Collected-but-unused warm-up samples used to establish a baseline when
+    /// none was provided before streaming (kills plug-in false positives).
+    pub baseline_samples: Vec<Vec<f64>>,
+    /// True once a baseline has been established (explicit calibration or a
+    /// completed warm-up buffer). Detection is suppressed until this is set.
+    pub baseline_ready: bool,
 }
+
+/// Number of fresh stream readings to collect before auto-enabling anomaly
+/// detection on a newly-attached device.
+pub const WARMUP_SAMPLES: usize = 60;
 
 impl FailSafeSystem {
     pub fn new(n_channels: usize) -> Self {
@@ -504,11 +514,51 @@ impl FailSafeSystem {
             alert_level: 0,
             consecutive_anomalies: 0,
             consecutive_normal: 0,
+            baseline_samples: Vec::new(),
+            baseline_ready: false,
         }
     }
 
-    /// Fail-safe detection: if ANY detector triggers, we alert.
+    /// Fail-safe detection: if ANY detector triggers, we alert. Anomalies are
+    /// suppressed until a baseline is established so a freshly-attached device
+    /// doesn't scream "ANOMALY" while its mean/covariance are still unknown.
     pub fn detect(&mut self, reading: &[f64]) -> Result<FailSafeResult> {
+        // If a baseline wasn't calibrated up front, warm up from the live
+        // stream: buffer the first WARMUP_SAMPLES readings, then calibrate all
+        // detectors at once. Until then, report "warming up" and never anomaly.
+        if !self.baseline_ready {
+            // An explicit/manual calibration already populated the detectors —
+            // treat that as ready and skip the deferred warm-up.
+            if self.detectors.iter().any(|d| d.baseline_n > 0) {
+                self.baseline_ready = true;
+            } else if self.baseline_samples.len() < WARMUP_SAMPLES {
+                self.baseline_samples.push(reading.to_vec());
+                if self.baseline_samples.len() == WARMUP_SAMPLES {
+                    let samples = self.baseline_samples.clone();
+                    for detector in &mut self.detectors {
+                        let _ = detector.calibrate_baseline(&samples);
+                    }
+                    self.baseline_samples.clear();
+                    self.baseline_ready = true;
+                } else {
+                    return Ok(FailSafeResult {
+                        is_anomaly: false,
+                        anomaly_votes: 0,
+                        max_confidence: 0.0,
+                        alert_level: 0,
+                        alert_name: "warming_up".to_string(),
+                        consecutive_anomalies: 0,
+                        sensor_failures: Vec::new(),
+                        degraded_sensors: Vec::new(),
+                        warming_up: true,
+                        baseline_progress: self.baseline_samples.len() as f64 / WARMUP_SAMPLES as f64,
+                    });
+                }
+            } else {
+                self.baseline_ready = true;
+            }
+        }
+
         let mut results = Vec::new();
         for detector in &self.detectors {
             results.push(detector.detect(reading)?);
@@ -575,6 +625,8 @@ impl FailSafeSystem {
             consecutive_anomalies: self.consecutive_anomalies,
             sensor_failures,
             degraded_sensors,
+            warming_up: false,
+            baseline_progress: 1.0,
         })
     }
 
@@ -616,6 +668,11 @@ pub struct FailSafeResult {
     pub consecutive_anomalies: usize,
     pub sensor_failures: Vec<SensorFailure>,
     pub degraded_sensors: Vec<usize>,
+    /// True while the detector is still establishing a baseline after connect —
+    /// anomalies are not asserted during this phase (avoids plug-in noise).
+    pub warming_up: bool,
+    /// 0.0→1.0 baseline warm-up progress (only meaningful while warming_up).
+    pub baseline_progress: f64,
 }
 
 /// Sensor failure record.
@@ -935,6 +992,28 @@ mod tests {
         // Normal reading
         let result = system.detect(&vec![1.0, 2.0, 3.0]).unwrap();
         assert_eq!(result.alert_level, 0);
+    }
+
+    #[test]
+    fn test_fail_safe_warm_up_suppresses_false_positive() {
+        // A freshly-created fail-safe with NO explicit baseline must NOT
+        // report an anomaly during the warm-up window (the old behaviour fired
+        // on essentially every reading because baseline_mean was all zeros).
+        let mut system = FailSafeSystem::new(3);
+
+        // First WARMUP_SAMPLES-1 readings: reported as warming up, never anomaly.
+        for _ in 0..(WARMUP_SAMPLES - 1) {
+            let r = system.detect(&[42.0, 43.0, 44.0]).unwrap();
+            assert!(!r.is_anomaly, "must not alarm during warm-up");
+            assert!(r.warming_up, "expected warming-up phase");
+        }
+
+        // The final warm-up sample flips it to ready and calibrates the baseline.
+        let r = system.detect(&[42.0, 43.0, 44.0]).unwrap();
+        assert!(!r.warming_up, "baseline should be established now");
+        assert!(system.baseline_ready);
+        // A stable reading close to the just-calibrated baseline must be normal.
+        assert!(!r.is_anomaly);
     }
 
     #[test]
