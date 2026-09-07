@@ -128,7 +128,7 @@ pub use calibration::{Calibrator, CalibrationProfile, CrossDeviceCalibrator};
 pub use health::{HealthMonitor, SensorHealth, HealthStatus, FleetHealth, fisher_discriminant_ratio, pairwise_fdr, euclidean_distance, cosine_similarity, similarity_warning};
 pub use protocol::{OsmProtocol, OsmMessage};
 pub use preprocessing::{RawData, BaselineCorrection, BaselineMethod, SignalFilter, FilterType, WindowExtractor, DataValidator};
-pub use adaptive::{AdaptiveAnomalyDetector, AdaptiveThreshold, FailSafeSystem, LabelingSystem, DetectionResult, AccuracyImprovement, DetectorState, LabelingStats, FailSafeResult, LabelRecord};
+pub use adaptive::{AdaptiveAnomalyDetector, AdaptiveThreshold, DetectionConfig, FailSafeSystem, LabelingSystem, DetectionResult, AccuracyImprovement, DetectorState, LabelingStats, FailSafeResult, LabelRecord};
 pub use poisoning::{PoisoningDetector, SensorHealthConfig, SensorHealthStatus, SensorMetrics, DegradationType};
 pub use quality::{compute_quality, ChannelSeries, QualityParams, QualityReport};
 pub use training::{train_classifier, TrainOptions, TrainingReport, ClassifierModel, ModelCard,

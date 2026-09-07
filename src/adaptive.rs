@@ -3,6 +3,44 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use crate::{Result, OpenSmellError};
 
+/// Operator-tunable live-detection behaviour.
+///
+/// These controls exist so a monitoring deployment can answer two questions
+/// its operator actually cares about:
+///   * "how smooth is the baseline?"  -> `smoothing_alpha`
+///   * "how different does a reading have to be before we call it out?" -> `sensitivity`
+///   * "how fast do we forgive slow environmental drift?" -> `drift_alpha`
+///
+/// The values are plain floats so they survive JSON round-trips for the
+/// desktop settings UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectionConfig {
+    /// EWMA weight applied to each new sample before scoring. `1.0` passes the
+    /// raw reading through untouched; lower values damp single-sample spikes
+    /// (a `0.5` filter moves halfway toward the new value each sample).
+    pub smoothing_alpha: f64,
+    /// EWMA rate at which the baseline chases *normal* readings. `0.0` freezes
+    /// the baseline (only explicit re-calibration moves it); a small value
+    /// absorbs slow environmental drift (warming-up sensors, a slowly changing
+    /// fermenter) without masking a real step change. Applied per normal sample.
+    pub drift_alpha: f64,
+    /// Detection sensitivity: effective threshold = threshold / sensitivity.
+    /// `1.0` keeps the calibrated (adaptive, ~target FPR) behaviour; `>1`
+    /// flags smaller deviations, `<1` requires a bigger difference. This is the
+    /// "by how much" control — tune it per deployment.
+    pub sensitivity: f64,
+}
+
+impl Default for DetectionConfig {
+    fn default() -> Self {
+        Self {
+            smoothing_alpha: 0.6,
+            drift_alpha: 0.002,
+            sensitivity: 1.0,
+        }
+    }
+}
+
 /// Adaptive threshold that improves with observed data using Welford's online algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveThreshold {
@@ -142,6 +180,9 @@ pub struct AdaptiveAnomalyDetector {
     pub last_baseline_update: f64,
     pub platt_a: f64,
     pub platt_b: f64,
+    pub config: DetectionConfig,
+    /// EWMA-filtered copy of the last scored reading (per channel).
+    pub smoothed_state: Option<Vec<f64>>,
 }
 
 impl AdaptiveAnomalyDetector {
@@ -162,7 +203,16 @@ impl AdaptiveAnomalyDetector {
             last_baseline_update: timestamp_now(),
             platt_a: 1.0,
             platt_b: 0.0,
+            config: DetectionConfig::default(),
+            smoothed_state: None,
         }
+    }
+
+    /// Replace the detector configuration (smoothing drift, sensitivity) that
+    /// governs every subsequent scoring pass. The baseline/adaptive thresholds
+    /// themselves are left untouched.
+    pub fn set_config(&mut self, config: DetectionConfig) {
+        self.config = config;
     }
 
     /// Initial calibration from baseline data.
@@ -216,37 +266,77 @@ impl AdaptiveAnomalyDetector {
                 expected: self.n_channels,
             });
         }
+        Ok(self.score(reading))
+    }
 
+    /// Live scoring path: smooth the incoming reading with the configured EWMA
+    /// (one weight application per sample), score the smoothed value, and when
+    /// the result is normal chase the baseline with the drift-correction EWMA.
+    /// This is the "forgive slow drift, call out real change" loop that makes
+    /// the detector usable for long-running monitoring (fermenters, ageing,
+    /// sensor warm-up) without re-calibrating by hand.
+    pub fn detect_drift_corrected(&mut self, reading: &[f64]) -> Result<DetectionResult> {
+        if reading.len() != self.n_channels {
+            return Err(OpenSmellError::InvalidChannelCount {
+                got: reading.len(),
+                expected: self.n_channels,
+            });
+        }
+        let smoothed: Vec<f64> = match &self.smoothed_state {
+            Some(prev) => reading.iter().zip(prev.iter())
+                .map(|(&x, &p)| self.config.smoothing_alpha * x + (1.0 - self.config.smoothing_alpha) * p)
+                .collect(),
+            None => reading.to_vec(),
+        };
+        self.smoothed_state = Some(smoothed.clone());
+
+        let result = self.score(&smoothed);
+        if !result.is_anomaly && self.baseline_n > 0 && self.config.drift_alpha > 0.0 {
+            let a = self.config.drift_alpha;
+            for i in 0..self.n_channels {
+                self.baseline_mean[i] = (1.0 - a) * self.baseline_mean[i] + a * smoothed[i];
+            }
+            self.last_baseline_update = timestamp_now();
+        }
+        Ok(result)
+    }
+
+    /// Score a single per-channel vector (raw or smoothed) against the baseline
+    /// without touching detector state.
+    fn score(&self, x: &[f64]) -> DetectionResult {
         // Mahalanobis distance
-        let raw_score = mahalanobis_distance(&self.baseline_mean, self.baseline_cov_inv.as_ref(), reading);
+        let raw_score = mahalanobis_distance(&self.baseline_mean, self.baseline_cov_inv.as_ref(), x);
 
         // Per-channel scores
-        let channel_scores: Vec<f64> = reading.iter().zip(self.baseline_mean.iter())
+        let channel_scores: Vec<f64> = x.iter().zip(self.baseline_mean.iter())
             .map(|(&r, &m)| (r - m).abs())
             .collect();
 
-        // Adaptive threshold check
+        // Adaptive threshold check — scaled by the operator's sensitivity.
+        // sensitivity > 1 => easier to trigger (smaller differences count).
         let mut triggered_channels = Vec::new();
         for (ch, (score, threshold)) in channel_scores.iter().zip(self.thresholds.iter()).enumerate() {
-            if *score > threshold.current_threshold {
+            let effective = threshold.current_threshold / self.config.sensitivity;
+            if *score > effective {
                 triggered_channels.push(ch);
             }
         }
         let is_anomaly = !triggered_channels.is_empty();
 
         // Calibrated confidence (Platt scaling)
-        let confidence = self.platt_scale(raw_score).clamp(0.0, 1.0);
+        let confidence = platt_sigmoid(raw_score, self.platt_a, self.platt_b).clamp(0.0, 1.0);
 
-        // Drift compensation
+        // Drift compensation over wall-clock since calibration (kept for
+        // continuity with the original adaptive model).
         let time_since_update = timestamp_now() - self.last_baseline_update;
         let drift_factor = (-0.001 * time_since_update).exp();
-        let adjusted_threshold = self.thresholds[0].current_threshold * drift_factor;
+        let adjusted_threshold = self.thresholds[0].current_threshold / self.config.sensitivity * drift_factor;
 
         // Threshold confidence (average across channels)
         let threshold_confidence: f64 = self.thresholds.iter().map(|t| t.confidence()).sum::<f64>() 
             / self.n_channels as f64;
 
-        Ok(DetectionResult {
+        DetectionResult {
             is_anomaly,
             raw_score,
             calibrated_confidence: confidence,
@@ -255,18 +345,20 @@ impl AdaptiveAnomalyDetector {
             threshold: adjusted_threshold,
             threshold_confidence,
             n_feedback_samples: self.feedback_history.len(),
-        })
+        }
     }
 
     /// Update detector with user feedback — the core learning loop.
     pub fn update_with_feedback(&mut self, reading: &[f64], was_anomaly: bool, note: &str) -> Result<()> {
-        let detect_result = self.detect(reading)?;
+        // Score with the same smoothing discipline as the live path so the
+        // feedback record and the detector agree about what "normal" means.
+        let result = self.detect_drift_corrected(reading)?;
 
         let record = FeedbackRecord {
             timestamp: timestamp_now(),
             was_anomaly,
             user_confirmed: true,
-            score: detect_result.raw_score,
+            score: result.raw_score,
             sensor_readings: reading.to_vec(),
             user_note: note.to_string(),
         };
@@ -296,11 +388,6 @@ impl AdaptiveAnomalyDetector {
         self.update_drift(reading);
 
         Ok(())
-    }
-
-    /// Convert raw Mahalanobis distance to calibrated probability.
-    fn platt_scale(&self, raw_score: f64) -> f64 {
-        1.0 / (1.0 + (-self.platt_a * raw_score + self.platt_b).exp())
     }
 
     /// Retrain Platt scaling parameters from feedback history.
@@ -470,6 +557,11 @@ pub struct ThresholdState {
     pub confidence: f64,
 }
 
+/// Sigmoid used for calibrated probability (Platt scaling).
+fn platt_sigmoid(raw_score: f64, a: f64, b: f64) -> f64 {
+    1.0 / (1.0 + (-a * raw_score + b).exp())
+}
+
 /// Neg-log-likelihood for Platt scaling optimization.
 fn neg_log_likelihood(scores: &[f64], labels: &[f64], a: f64, b: f64) -> f64 {
     scores.iter().zip(labels.iter())
@@ -495,6 +587,8 @@ pub struct FailSafeSystem {
     /// True once a baseline has been established (explicit calibration or a
     /// completed warm-up buffer). Detection is suppressed until this is set.
     pub baseline_ready: bool,
+    /// Operator-tunable detection behaviour, shared by all ensemble detectors.
+    pub config: DetectionConfig,
 }
 
 /// Number of fresh stream readings to collect before auto-enabling anomaly
@@ -503,7 +597,7 @@ pub const WARMUP_SAMPLES: usize = 60;
 
 impl FailSafeSystem {
     pub fn new(n_channels: usize) -> Self {
-        Self {
+        let mut s = Self {
             n_channels,
             detectors: vec![
                 AdaptiveAnomalyDetector::new(n_channels, 0.05),  // Standard
@@ -516,6 +610,26 @@ impl FailSafeSystem {
             consecutive_normal: 0,
             baseline_samples: Vec::new(),
             baseline_ready: false,
+            config: DetectionConfig::default(),
+        };
+        s.propagate_config();
+        s
+    }
+
+    /// Apply a detection configuration to every ensemble detector.
+    pub fn set_config(&mut self, config: DetectionConfig) {
+        self.config = config;
+        self.propagate_config();
+    }
+
+    /// Current detection configuration.
+    pub fn config(&self) -> DetectionConfig {
+        self.config.clone()
+    }
+
+    fn propagate_config(&mut self) {
+        for detector in &mut self.detectors {
+            detector.set_config(self.config.clone());
         }
     }
 
@@ -545,6 +659,10 @@ impl FailSafeSystem {
                         is_anomaly: false,
                         anomaly_votes: 0,
                         max_confidence: 0.0,
+                        raw_score: 0.0,
+                        calibrated_confidence: 0.0,
+                        triggered_channels: Vec::new(),
+                        max_delta: 0.0,
                         alert_level: 0,
                         alert_name: "warming_up".to_string(),
                         consecutive_anomalies: 0,
@@ -552,6 +670,7 @@ impl FailSafeSystem {
                         degraded_sensors: Vec::new(),
                         warming_up: true,
                         baseline_progress: self.baseline_samples.len() as f64 / WARMUP_SAMPLES as f64,
+                        smoothed: reading.to_vec(),
                     });
                 }
             } else {
@@ -560,17 +679,24 @@ impl FailSafeSystem {
         }
 
         let mut results = Vec::new();
-        for detector in &self.detectors {
-            results.push(detector.detect(reading)?);
+        let mut smoothed = Vec::new();
+        for detector in &mut self.detectors {
+            let r = detector.detect_drift_corrected(reading)?;
+            smoothed = detector.smoothed_state.clone().unwrap_or_default();
+            results.push(r);
         }
 
         // Consensus: majority vote
         let anomaly_votes = results.iter().filter(|r| r.is_anomaly).count();
         let mut is_anomaly = anomaly_votes >= 2;
 
-        // Worst-case: if any detector has very high confidence, alert
+        // Worst-case: if any detector has very high confidence, alert — but only
+        // when at least one per-channel verdict also fired. The confidence is a
+        // Platt-scaled Mahalanobis distance, which blows up on poorly-conditioned
+        // covariance matrices; letting it veto an all-normal per-channel verdict
+        // would scream ANOMALY over noise.
         let max_confidence = results.iter().map(|r| r.calibrated_confidence).fold(0.0f64, f64::max);
-        if max_confidence > 0.9 {
+        if anomaly_votes >= 1 && max_confidence > 0.9 {
             is_anomaly = true;
         }
 
@@ -616,10 +742,32 @@ impl FailSafeSystem {
             _ => "unknown",
         }.to_string();
 
+        // Honest "how different is it?" answer for the operator: the raw
+        // Mahalanobis score and confidence of the strongest detector, plus the
+        // per-channel delta of the biggest deviation and which channels moved.
+        let raw_score = results.iter().map(|r| r.raw_score).fold(0.0f64, f64::max);
+        let calibrated_confidence = max_confidence;
+        let mut triggered_channels: Vec<usize> = Vec::new();
+        for r in &results {
+            for &ch in &r.triggered_channels {
+                if !triggered_channels.contains(&ch) {
+                    triggered_channels.push(ch);
+                }
+            }
+        }
+        triggered_channels.sort_unstable();
+        let max_delta = results.iter()
+            .flat_map(|r| r.channel_scores.iter().copied())
+            .fold(0.0f64, f64::max);
+
         Ok(FailSafeResult {
             is_anomaly,
             anomaly_votes,
             max_confidence,
+            raw_score,
+            calibrated_confidence,
+            triggered_channels,
+            max_delta,
             alert_level: self.alert_level,
             alert_name,
             consecutive_anomalies: self.consecutive_anomalies,
@@ -627,6 +775,7 @@ impl FailSafeSystem {
             degraded_sensors,
             warming_up: false,
             baseline_progress: 1.0,
+            smoothed,
         })
     }
 
@@ -663,6 +812,15 @@ pub struct FailSafeResult {
     pub is_anomaly: bool,
     pub anomaly_votes: usize,
     pub max_confidence: f64,
+    /// Raw Mahalanobis distance of the strongest detector (how different, in
+    /// "number of baseline std-dev" units — the honest magnitude answer).
+    pub raw_score: f64,
+    /// Probability calibration of `raw_score` via Platt scaling.
+    pub calibrated_confidence: f64,
+    /// Union of channels that exceeded their per-channel threshold.
+    pub triggered_channels: Vec<usize>,
+    /// Biggest per-channel deviation of this reading (raw sensor units).
+    pub max_delta: f64,
     pub alert_level: u8,
     pub alert_name: String,
     pub consecutive_anomalies: usize,
@@ -673,6 +831,8 @@ pub struct FailSafeResult {
     pub warming_up: bool,
     /// 0.0→1.0 baseline warm-up progress (only meaningful while warming_up).
     pub baseline_progress: f64,
+    /// EWMA-smoothed copy of this reading, per channel (matches what was scored).
+    pub smoothed: Vec<f64>,
 }
 
 /// Sensor failure record.
@@ -1050,5 +1210,88 @@ mod tests {
         assert_eq!(state.n_channels, 2);
         assert_eq!(state.baseline_n, 2);
         assert_eq!(state.thresholds.len(), 2);
+    }
+
+    #[test]
+    fn test_smoothing_damps_single_sample_spike() {
+        let baseline = vec![vec![1.0, 2.0], vec![1.1, 2.1], vec![0.9, 1.9], vec![1.05, 2.05]];
+        let mut detector = AdaptiveAnomalyDetector::new(2, 0.05);
+        detector.calibrate_baseline(&baseline).unwrap();
+        // Heavy smoothing: a one-sample spike must not fire the detector.
+        detector.set_config(DetectionConfig { smoothing_alpha: 0.1, drift_alpha: 0.0, sensitivity: 1.0 });
+
+        // Normal reading warms the smoother onto the baseline nominal value.
+        let r0 = detector.detect_drift_corrected(&[1.0, 2.0]).unwrap();
+        eprintln!("DEBUG normal -> {}", serde_json::to_string(&r0).unwrap());
+        // A single spike of +6 on ch0: with alpha 0.1 the smoothed  jump is +0.6,
+        // below the ~1.0 per-channel threshold — so no false alarm.
+        let r = detector.detect_drift_corrected(&[7.0, 2.0]).unwrap();
+        eprintln!("DEBUG spike -> {}", serde_json::to_string(&r).unwrap());
+        assert!(!r.is_anomaly, "single-sample spike must be damped by EWMA smoothing");
+
+        // A sustained step keeps pushing the smoother until it must fire.
+        let mut hit = false;
+        for _ in 0..40 {
+            let r = detector.detect_drift_corrected(&[7.0, 2.0]).unwrap();
+            hit |= r.is_anomaly;
+            if hit { break; }
+        }
+        assert!(hit, "a sustained step must eventually trip detection");
+    }
+
+    #[test]
+    fn test_drift_correction_absorbs_slow_env_change_folder() {
+        let baseline = vec![vec![1.0, 2.0], vec![1.1, 2.1], vec![0.9, 1.9], vec![1.05, 2.05]];
+        let mut system = FailSafeSystem::new(2);
+        for detector in &mut system.detectors {
+            detector.calibrate_baseline(&baseline).unwrap();
+        }
+        // Aggressive (but slow-vs-streaming) drift correction enabled.
+        system.set_config(DetectionConfig { smoothing_alpha: 1.0, drift_alpha: 0.02, sensitivity: 1.0 });
+        assert!(!system.detect(&[1.0, 2.0]).unwrap().is_anomaly);
+
+        // Ramp the "true" value +3 over many normal samples: with drift
+        // correction the baseline chases it, so by the end it reads as normal.
+        for i in 0..300 {
+            let v = 1.0 + 3.0 * (i as f64 / 300.0);
+            let r = system.detect(&[v, 2.0 + v - 1.0]).unwrap();
+            assert!(!r.is_anomaly, "slow ramp must be forgiven by EWMA drift correction");
+        }
+        // After the drift-followed ramp, a *step* beyond the chased level (not
+        // a continuation) must still be flagged — a real event, not drift.
+        assert!(system.detect(&[6.0, 7.0]).unwrap().is_anomaly,
+            "an abrupt step after the ramp must still be flagged");
+
+        // Disable drift: the frozen baseline now calls the drifted normal state
+        // an anomaly — proving drift correction is what made the ramp pass.
+        let mut frozen = FailSafeSystem::new(2);
+        for detector in &mut frozen.detectors {
+            detector.calibrate_baseline(&baseline).unwrap();
+        }
+        frozen.set_config(DetectionConfig { smoothing_alpha: 1.0, drift_alpha: 0.0, sensitivity: 1.0 });
+        assert!(!frozen.detect(&[1.0, 2.0]).unwrap().is_anomaly);
+        let r = frozen.detect(&[4.0, 5.0]).unwrap();
+        assert!(r.is_anomaly, "without drift correction the same shift should alarm");
+    }
+
+    #[test]
+    fn test_sensitivity_is_the_how_much_control() {
+        let baseline = vec![vec![1.0, 2.0], vec![1.1, 2.1], vec![0.9, 1.9], vec![1.05, 2.05]];
+        let mut strict = FailSafeSystem::new(2);
+        for detector in &mut strict.detectors {
+            detector.calibrate_baseline(&baseline).unwrap();
+        }
+        strict.set_config(DetectionConfig { smoothing_alpha: 1.0, drift_alpha: 0.0, sensitivity: 0.5 });
+        assert!(!strict.detect(&[1.0, 2.0]).unwrap().is_anomaly);
+        // A small deviation (+0.8) is ignored at low sensitivity.
+        assert!(!strict.detect(&[1.8, 2.0]).unwrap().is_anomaly, "low sensitivity must tolerate small deltas");
+
+        let mut sensitive = FailSafeSystem::new(2);
+        for detector in &mut sensitive.detectors {
+            detector.calibrate_baseline(&baseline).unwrap();
+        }
+        sensitive.set_config(DetectionConfig { smoothing_alpha: 1.0, drift_alpha: 0.0, sensitivity: 4.0 });
+        assert!(!sensitive.detect(&[1.0, 2.0]).unwrap().is_anomaly);
+        assert!(sensitive.detect(&[1.8, 2.0]).unwrap().is_anomaly, "high sensitivity must call out the same delta");
     }
 }
