@@ -1217,12 +1217,10 @@ mod tests {
         detector.set_config(DetectionConfig { smoothing_alpha: 0.1, drift_alpha: 0.0, sensitivity: 1.0 });
 
         // Normal reading warms the smoother onto the baseline nominal value.
-        let r0 = detector.detect_drift_corrected(&[1.0, 2.0]).unwrap();
-        eprintln!("DEBUG normal -> {}", serde_json::to_string(&r0).unwrap());
+        detector.detect_drift_corrected(&[1.0, 2.0]).unwrap();
         // A single spike of +6 on ch0: with alpha 0.1 the smoothed  jump is +0.6,
         // below the ~1.0 per-channel threshold — so no false alarm.
         let r = detector.detect_drift_corrected(&[7.0, 2.0]).unwrap();
-        eprintln!("DEBUG spike -> {}", serde_json::to_string(&r).unwrap());
         assert!(!r.is_anomaly, "single-sample spike must be damped by EWMA smoothing");
 
         // A sustained step keeps pushing the smoother until it must fire.
