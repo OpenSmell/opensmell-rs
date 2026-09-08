@@ -1011,12 +1011,8 @@ fn invert_matrix(m: &[Vec<f64>]) -> Result<Vec<Vec<f64>>> {
             return Err(OpenSmellError::AnomalyDetection("Matrix is singular".to_string()));
         }
 
-        // Swap rows
+        // Swap rows (element-wise — aug is n×(2n), row indices only go 0..n)
         if max_row != col {
-            for j in 0..(2 * n) {
-                aug.swap(col, j);  // This is wrong, need to swap specific elements
-            }
-            // Fix: manual swap
             for j in 0..(2 * n) {
                 let temp = aug[col][j];
                 aug[col][j] = aug[max_row][j];
