@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["OpenSmell Contributors"]
-repository = "https://github.com/opensmell/opensmell"
+repository = "https://github.com/OpenSmell/opensmell-rs"
+homepage = "https://opensmell.xyz"
+documentation = "https://docs.rs/opensmell"
+readme = "README.md"
+keywords = ["e-nose", "digital-olfaction", "gas-sensors", "feature-extraction", "anomaly-detection"]
 description = "MOX e-nose feature extraction, anomaly detection, and calibration engine"
 
 [dependencies]
