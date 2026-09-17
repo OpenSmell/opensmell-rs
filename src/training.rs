@@ -1317,7 +1317,7 @@ pub fn train_classifier(
     let mut ys = Vec::with_capacity(raw_x.len());
     for g in &ordered {
         let idx = classes.iter().position(|c| c == &g.label).unwrap_or(0);
-        ys.extend(std::iter::repeat(idx).take(g.windows.len()));
+        ys.extend(std::iter::repeat_n(idx, g.windows.len()));
     }
     let n_windows = ys.len();
 

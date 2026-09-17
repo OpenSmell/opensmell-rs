@@ -60,10 +60,13 @@ fleets, and new question types — so the core design separates **detection
 - **Health.** Per-channel fleet health: `OK / WARNING / CRITICAL / FAILED`
   from coefficient-of-variation, noise floor, drift rate, and explicit
   stuck/flatline detection (`std ≤ 1e-9 ⇒ FAILED`).
-- **Anomaly (current).** Per-channel adaptive thresholds (Welford mean+z·σ) and
-  a Mahalanobis distance against a calibrated baseline, ensembled across three
-  false-positive budgets with confidence calibration (Platt) and escalation
-  (warning/critical/emergency). Shipped in `opensmell-rs`.
+- **Anomaly (current).** The dual-Kalman engine (`src/anomaly/dual.rs`): a state
+  filter for working levels coupled to a parameter filter for hidden gain/offset,
+  multi-regime clustering with humidity/temperature covariates, a typology head,
+  Platt calibration, and stimulus-confirmed poison health findings — all behind
+  the same verdict/confidence/alert contract. The legacy Welford/EWMA/Mahalanobis
+  stack (`adaptive.rs`) is retained with `#[deprecated]` knobs for a clean
+  cutover. Shipped in `opensmell-rs`.
 - **Format.** `.osmell` container v1.1.0 (sensor/calibration/sample/events
   sections) read and written identically in Python and JS; JSON-events stream
   for interop.
@@ -169,6 +172,12 @@ drift):
 This design single-sources every "higher-level" claim (drift, poison, health,
 regime) and remains honest under humidity/temperature interference.
 
+The shipped engine (Wave 2/2.5) goes one step deeper on the measurement model:
+an optional adsorption-memory state `m` per channel absorbs desorption residue,
+and the default linear `g·x + o` can be replaced with the power-law
+`g·φ(x, α) + o` (tracking α per channel) so concentration compression is read as
+state, never as fake gain decay. Both default off for a drop-in legacy config.
+
 ---
 
 ## 5. Roadmap — five waves
@@ -188,35 +197,132 @@ Deliverables:
 Done when: both documents are committed to `opensmell-rs`, and an engineer with
 no context can implement Wave 2 from the design doc alone.
 
-### Wave 2 — Engine implementation (opensmell-rs)
+### Wave 2 — Engine implementation (opensmell-rs) — shipped
 
 Replace the detection core with the dual-Kalman design:
 
-1. Dual EKF/UKF state+parameter filters (`adaptive.rs`), keeping the public
-   verdict/confidence/alert contract stable so apps don't break mid-wave.
-2. Multi-regime baseline via online clustering; humidity/temperature covariates
-   in the measurement model.
-3. Typology head (spike/step/ramp/pulse) on the innovation stream.
-4. Lin et al. Platt solver (replace 3×3 grid search in `retrain_platt_scaling`).
-5. Stimulus-based poison/health detection (gain-per-reference) wired into the
-   consensus path (`poisoning.rs` → `FailSafeSystem`).
+**Status.** All five items are shipped in `opensmell-rs` (spec: `anomaly-engine-design.md`).
+The public verdict/confidence/alert contract stayed stable so apps did not break.
+
+1. Dual EKF/UKF state+parameter filters — **shipped** as `src/anomaly/dual.rs`
+   (state filter linear- or unscented-Kalman per `state_filter`; parameter filter
+   tracks `[g, o]` per channel).
+2. Multi-regime baseline via online clustering (`regimes.rs`) and
+   humidity/temperature covariates in the measurement model — **shipped**.
+3. Typology head (spike/step/ramp/pulse) on the innovation stream
+   (`typology.rs`) — **shipped**.
+4. Lin et al. Platt solver (`platt.rs`, replacing the 3×3 grid search) — **shipped**.
+5. Stimulus-based poison/health detection (`stimulus.rs`) wired into the
+   consensus path — **shipped**.
 
 Done when: the replaced modules pass the existing unit-test matrix
 (synthetic spike/step/ramp behaviours must still hold), plus new tests for
 regime switches (no alarm), humidity-tracking (no alarm), and poison (degraded
-gain ⇒ health drop, not a false "event").
+gain ⇒ health drop, not a false "event"). — Done (139 tests green, incl.
+`tests/wave2_gate.rs` pinning the full §11.1–11.2 matrix and the replay
+harness).
+
+### Wave 2.5 — Measurement physics (adsorption, power-law, auto-tune) — shipped
+
+Squeezed in after the engine core so the *measurement model* matches the MOX
+physics the engine was designed around:
+
+1. **Adsorption memory** (`AdsorptionConfig`). A per-channel memory state `m`
+   that decays with a desorption time constant `τ` absorbs the "still smells
+   like cake" residue after a heavy exposure — so a desorption tail is
+   *predicted* by the filter and absorbed, not read as drift or a fresh event.
+   Adsorption/memory effects get their own transient state; they are not a
+   spike/ramp/drift classification.
+2. **Power-law response** (`ResponseConfig`). The default `y = g·x + o` is only
+   the local Taylor regime of the true MOX power-law law. When enabled the
+   measurement model becomes `y_i = g_i·φ(x_i, α_i) + o_i` with
+   `φ(x, α) = |x|ᵅ·sgn(x)`, and the parameter filter tracks
+   `[g, o, α]` per channel — so a large concentration spike at the compressed
+   high end is read as the state `x`, not as gain decay (the misreading that
+   would otherwise fake a poison confirmation).
+3. **Auto-tune calibration** (`calibration::AutoTune`). `q_state`, `q_param`,
+   the desorption `τ`, and the exponent `α` are *derived from measurements*
+   (baseline variance, drift first-differences, desorption tails, log-log
+   response fits) instead of engineer-guessed constants.
+
+**Backward compatibility.** Both configs default to off/linear with
+`#[serde(default)]`, so a legacy `EngineConfig` JSON round-trips unchanged.
 
 ### Wave 3 — Validation (papers-grade numbers)
 
+**Status.** Real-data TPR/FPR/PPV + latency gate **closed on the UCI dynamic
+mixtures corpus** (`src/bin/realdata_eval.rs`, §11.4, §11.6 of the engine design
+doc): full 11.6–11.7 h causal replays score 89/89 and 95/98 events at
+`sensitivity = 3` with clean FPR ≈ 1e-3, holdout-selected (fixed rule, no
+retrofitting), with Wilson/bootstrap 95% CIs (`rs_validate.py`; archived JSON
+at `e-nose-evals/u2_gas_leak/results/rs_realdata_*.json`). The Wörner et al.
+(2025) long-horizon drift corpus remains the 12-month extension. The second
+generalization corpus (UCI home activity, `src/bin/indoor_eval.rs`, §11.5) was
+run and resolves as an **honest negative**: 6–7/68 stimuli at clean FPR
+0.0065–0.0130 with no admissible operating point, driven by low per-induction
+stimulus strength near the ambient home-activity noise floor (documented with a
+stimulus/drift audit; archived at
+`e-nose-evals/u2_gas_leak/results/rs_realdata_indoor_sens{2,3,4}.json`). The
+negative is partly algorithm-limited: an EWMA control chart (`src/anomaly/ewma.rs`,
+`--baseline ewma`) recovers 18–22/68 at admissible FPR on indoor-air but
+fails the dynamic-mixtures recordings — no single detector+params is
+admissible on both corpora yet (§11.7, the open cross-regime item). The
+recommended operating point is unchanged; the negative and headroom are
+published rather than tuned away. A third real-data gate added and **closed**
+(§11.9, `src/bin/tadi_eval.rs`): the TADI-2019 field corpus (Zenodo 8399829,
+controlled CH4 releases at an industrial site, six Figaro TGS MOS loggers with
+CRDS ground truth) scores 86% release detection (54/63) at sens=3 — Logger_H,
+closest to the release point, 100% at sens≥2.5 — with FA/month ~1,900 at sens=3
+measured during intermittent-plume gaps (a strict overestimate of background
+FA). The sensitivity/FPR tradeoff proves stable across all three real corpora,
+and the real-noise gap narrows to ~1 order on outdoor MOS data (archived at
+`e-nose-evals/u2_gas_leak/results/tadi_field_sweep.json`). A fourth gate
+**closed** (§11.10, `worner_eval.py`): the Wörner et al. (2025) 12-month /
+39-day / 62-channel MOX drift corpus shows the clean-air baseline drifts
+11–65σ/channel (log R) over the year — a slow additive offset that kills any
+static baseline within ~2 days (Mahalanobis FPR=1.000 from Day 3) but is
+absorbed by adaptive tracking: the EWMA with static Day-1 calibration and
+continuous causal replay detects 682/700 (97.4%) exposures with stage-1 FPR
+flat ~0.002–0.004 across all 40 days, bounding the additive drift term §11.8
+left open (archived at
+`e-nose-evals/u2_gas_leak/results/worner_ewma_a05_t5_continuous.json`).
+Separation quality of the tracked baseline is measured separately (§11.11,
+`reports/bench_separability_margin.json`): median event/clean margin +0.78σ,
+95% of windows positively separated, 0.2% clean FPR, 10 s onset latency.
+
 - Replay harness: run the Wörner et al. (2025) ~12-month, 62-sensor dataset
-  through the streaming path.
+  through the streaming path. — **harness shipped** (`replay_dataset`,
+  `ReplayMetrics`); the Wörner ingestion is the open extension, the UCI
+  dynamic-mixtures recordings already score end-to-end.
+- Real-data operating curve: `realdata_eval` replays the full UCI recordings at
+  10 Hz, calibrates on the earliest clean window, and reports per-event
+detection/latency + clean FPR vs the `--sensitivity` knob. — **done** (§11.4);
+   causal-calibration variant and holdout/CIs in §11.6.
 - Monte-Carlo calibration sweep across synthetic scenarios to publish
-  **TPR / FPR / PPV** and detection-latency curves.
+  **TPR / FPR / PPV** and detection-latency curves. — **done** (§11.8,
+  `src/bin/mc_sweep.rs`, archived under
+  `e-nose-evals/u2_gas_leak/results/mc_sweep_{ewma_full,dual_probe}.json`):
+  fixes the deployment budget FA ≤ 1/month ⇔ FPR ≲ 4e-7, shows both detectors
+  reach it on controlled noise where they target a regime (dual. sens ≤ 1.0,
+  EWMA α 0.02 thr ≥ 4 — TPR 1.0, 0 FA/month on squares and bursts), quantifies
+  the real-corpus FA excess as a 2–4-order additive device-noise term the
+  Wörner corpus must bound, and exposes the sens>1.0 FA cliff, the smooth-ramp
+  invisibility of the EWMA, and impulse-contamination FA leak. Synthetic
+  curves are NOT a substitute for real-device TPR/FPR/PPV.
 - Report the long-term MOX CV reproduction (25–41%) as the outside bound the
-  drift model must accommodate.
+  drift model must accommodate. (pending)
+- TADI-2019 field corpus (controlled industrial methane releases). — **done**
+  (§11.9 `src/bin/tadi_eval.rs`): closes the deployment-corpus gap with a
+  third independent real dataset; the additive real-noise term on outdoor MOS
+  data is ~1 order above the algorithmic ceiling (tightening the §11.8 2–4
+  order estimate, which was inflated by the dynamic-mixtures corpus's
+  high-channel/high-cadence controlled environment).
 
 Done when: there is a published (repo + docs site) TPR/FPR/PPV report on
-real data — the number papers and operators actually require.
+real data — the number papers and operators actually require. — **partially
+met**: real-data numbers are published in §11.4 and §11.9 (three independent
+corpora: dynamic-mixtures, home-activity, field methane); the docs-site page
+and the 12-month Wörner extension remain.
 
 ### Wave 4 — JS parity & interoperability guarantee
 
@@ -231,11 +337,20 @@ identically across Python/Rust/JS, verified by CI.
 
 ### Wave 5 — Product & data commons
 
+**Status.** Domain-adapter foundation shipped (`src/anomaly/adapters.rs`); the
+frontend and data commons remain open.
+
 - Frontend status/typology view (desktop + web): one status line, two time
   horizons (now = step/spike, hours = ramp/drift), "did this matter?" feedback.
+  — **adapter foundation shipped**: a general `ProcessAdapter` trait plus a
+  `FermentationAdapter` that maps the engine's regimes onto fermentation stages
+  (`idle / lag / exponential / stationary / decline`) and turns verdicts into
+  process events (`stage transition`, rapid/slow change, sensor fault) with a
+  one-line `summarize`. The engine stays general-purpose; domain interpretation
+  lives in the plugin.
 - Data commons: quality-gated corpus, schema registry, Data Hub / HF sync,
   cross-device calibration transfer (fleet bootstrapping: a calibrated board
-  seeds its uncalibrated siblings).
+  seeds its uncalibrated siblings). (pending)
 
 Done when: a new board reaches a usable baseline in minutes via fleet transfer,
 and the fleet dataset grows with exported `.osmell` + label feedback.

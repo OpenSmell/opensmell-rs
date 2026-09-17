@@ -138,7 +138,7 @@ fn median(values: &[f64]) -> f64 {
     let mut v = values.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = v.len();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (v[n / 2 - 1] + v[n / 2]) / 2.0
     } else {
         v[n / 2]
@@ -207,7 +207,7 @@ fn r0_from_samples(values: &[f64], n: usize) -> f64 {
     let mut sorted = window.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
-    let r0 = if sorted.len() % 2 == 0 {
+    let r0 = if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
         sorted[mid]

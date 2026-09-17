@@ -493,7 +493,7 @@ fn speed_from_volatility(pa: Option<f64>, gas: bool) -> ResponseSpeed {
 
 fn effective_vapor_pressure(c: &Chemical) -> EffectiveVaporPressure {
     if let Some(v) = c.props.vapor_pressure_25.value {
-        return EffectiveVaporPressure { pa: v, source: c.props.vapor_pressure_25.source.clone() };
+        return EffectiveVaporPressure { pa: v, source: c.props.vapor_pressure_25.source };
     }
     if let Some(an) = &c.props.antoine {
         return EffectiveVaporPressure {
@@ -615,17 +615,17 @@ fn run_constituent_chain(c: &Chemical, in_catalogue: bool) -> ConstituentVerdict
             ChainValue {
                 label: "Molecular weight".into(),
                 value: mw.map(|m| format!("{:.1} g/mol", m)).unwrap_or_else(|| "unknown".into()),
-                source: c.props.molecular_weight.source.clone(),
+                source: c.props.molecular_weight.source,
             },
             ChainValue {
                 label: "Boiling point".into(),
                 value: bp.map(|b| format!("{:.1} °C", b)).unwrap_or_else(|| "unknown".into()),
-                source: c.props.boiling_point.source.clone(),
+                source: c.props.boiling_point.source,
             },
             ChainValue {
                 label: "Vapor pressure @ 25 °C".into(),
                 value: fmt_pa(Some(vp.pa)),
-                source: vp.source.clone(),
+                source: vp.source,
             },
         ],
     });
@@ -669,7 +669,7 @@ fn run_constituent_chain(c: &Chemical, in_catalogue: bool) -> ConstituentVerdict
         values: vec![ChainValue {
             label: "Volatility class".into(),
             value: if c.props.gas == Some(true) { "gas".into() } else { vol_label.into() },
-            source: vp.source.clone(),
+            source: vp.source,
         }],
     });
 
@@ -677,11 +677,7 @@ fn run_constituent_chain(c: &Chemical, in_catalogue: bool) -> ConstituentVerdict
     let ratio_info = signal_ratio(c, &reference_compound());
     let hs_band: Option<SignalBand> = if head.1 {
         Some(SignalBand::Strong)
-    } else if let Some(h) = head.0 {
-        Some(headspace_ppm_band_impl(h))
-    } else {
-        None
-    };
+    } else { head.0.map(headspace_ppm_band_impl) };
     let mut signal_strength = SignalStrength::None;
     let (sig_verdict, sig_reason): (Verdict, String) = match hs_band {
         None => (
@@ -749,12 +745,12 @@ fn run_constituent_chain(c: &Chemical, in_catalogue: bool) -> ConstituentVerdict
                 } else {
                     "unknown".into()
                 },
-                source: head.2.clone(),
+                source: head.2,
             },
             ChainValue {
                 label: "Relative to ethanol".into(),
                 value: if matches!(ratio_info.1, DataSource::Unknown) { "unknown".into() } else { fmt_ratio(ratio_info.0) },
-                source: ratio_info.1.clone(),
+                source: ratio_info.1,
             },
         ],
     });

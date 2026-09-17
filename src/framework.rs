@@ -217,7 +217,7 @@ fn periodogram(x: &[f64], fs: f64) -> (Vec<f64>, Vec<f64>) {
         let f = (k as f64) * fs / n as f64;
         let mag_sq = re[k] * re[k] + im[k] * im[k];
         // scaling: 2/(N*fs) for interior, 1/(N*fs) for DC and Nyquist
-        let scale = if k == 0 || (n % 2 == 0 && k == n / 2) {
+        let scale = if k == 0 || (n.is_multiple_of(2) && k == n / 2) {
             1.0 / (n as f64 * fs)
         } else {
             2.0 / (n as f64 * fs)
@@ -842,7 +842,7 @@ fn compute_multi_exp_decay_bi(
 ) -> (f64, f64, f64, f64, f64, f64, f64) {
     let mut out = DECAY_FAIL;
     // single-exp fallback
-    if y.len() > 0 {
+    if !y.is_empty() {
         let p0 = vec![a0, 3.0, 0.0];
         if let Some(popt) = lm_fit(
             t,
@@ -1000,7 +1000,7 @@ pub fn framework_window_features(window: &[Vec<f64>], r0_samples: usize, sr: f64
         // abs block
         let (raw_resistance, baseline, voltage, calib) =
             compute_channel_absolute(series, Some(r0_used), 1.0, -0.5);
-        feats[base + 0] = baseline; // ch_abs_baseline_resistance
+        feats[base] = baseline; // ch_abs_baseline_resistance
         feats[base + 1] = calib; // ch_abs_calibrated_concentration
         feats[base + 2] = raw_resistance; // ch_abs_raw_resistance
         feats[base + 3] = voltage; // ch_abs_voltage
@@ -1053,7 +1053,7 @@ pub fn framework_window_features(window: &[Vec<f64>], r0_samples: usize, sr: f64
         .map(|i| device_agnostic[i].relative_amplitude)
         .collect();
     let max = active_dr.iter().copied().fold(0.0f64, f64::max);
-    feats[global_start + 0] = if active_dr.is_empty() { 0.0 } else { max };
+    feats[global_start] = if active_dr.is_empty() { 0.0 } else { max };
     feats[global_start + 1] = if active_dr.is_empty() { 0.0 } else { mean(&active_dr) };
     feats[global_start + 2] = active_dr.len() as f64;
     let total_auc: f64 = (0..n_ch)

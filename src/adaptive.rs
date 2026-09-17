@@ -2,6 +2,10 @@ use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use crate::{Result, OpenSmellError};
+use crate::anomaly::{
+    AmbientModel, AmbientReading, DualKalmanEngine, EngineVerdict, HealthFinding,
+    HealthFindingKind, StateFilterKind, Typology,
+};
 
 /// Operator-tunable live-detection behaviour.
 ///
@@ -13,30 +17,70 @@ use crate::{Result, OpenSmellError};
 ///
 /// The values are plain floats so they survive JSON round-trips for the
 /// desktop settings UI.
+///
+/// Wave-2 note: the primary live path (the `FailSafeSystem` dual-Kalman engine)
+/// consumes `sensitivity`, `q_state`, `q_param` and `use_ukf`. The legacy
+/// `smoothing_alpha`/`drift_alpha` fields remain for the standalone
+/// `AdaptiveAnomalyDetector` path and for configuration JSON written by older
+/// apps (they are ignored by the engine path, whose baseline/`R` and parameter
+/// walk take over those two jobs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionConfig {
     /// EWMA weight applied to each new sample before scoring. `1.0` passes the
     /// raw reading through untouched; lower values damp single-sample spikes
     /// (a `0.5` filter moves halfway toward the new value each sample).
+    ///
+    /// **Deprecated.** The dual-Kalman engine path (the default) replaces this
+    /// with `q_state` (state process noise) on the state filter; the field only
+    /// remains for the legacy standalone `AdaptiveAnomalyDetector` path and for
+    /// configuration JSON written by older apps. Do not use for new code.
+    #[deprecated(note = "superseded by q_state in the dual-Kalman engine")]
     pub smoothing_alpha: f64,
     /// EWMA rate at which the baseline chases *normal* readings. `0.0` freezes
     /// the baseline (only explicit re-calibration moves it); a small value
     /// absorbs slow environmental drift (warming-up sensors, a slowly changing
     /// fermenter) without masking a real step change. Applied per normal sample.
+    ///
+    /// **Deprecated.** Replaced by `q_param` (parameter walk noise) in the
+    /// dual-Kalman engine; kept for the legacy path and old JSON only.
+    #[deprecated(note = "superseded by q_param in the dual-Kalman engine")]
     pub drift_alpha: f64,
     /// Detection sensitivity: effective threshold = threshold / sensitivity.
     /// `1.0` keeps the calibrated (adaptive, ~target FPR) behaviour; `>1`
     /// flags smaller deviations, `<1` requires a bigger difference. This is the
     /// "by how much" control — tune it per deployment.
     pub sensitivity: f64,
+    /// Dual-Kalman state filter kind: `unscented` (default) or `kalman`.
+    #[serde(default = "default_use_ukf")]
+    pub use_ukf: bool,
+    /// State process noise per channel (baseline smoothness) for the engine.
+    #[serde(default = "default_q_state")]
+    pub q_state: f64,
+    /// Parameter walk noise per channel (how fast drift is absorbed) for the engine.
+    #[serde(default = "default_q_param")]
+    pub q_param: f64,
+}
+
+fn default_use_ukf() -> bool {
+    true
+}
+fn default_q_state() -> f64 {
+    1e-3
+}
+fn default_q_param() -> f64 {
+    1e-6
 }
 
 impl Default for DetectionConfig {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             smoothing_alpha: 0.6,
             drift_alpha: 0.002,
             sensitivity: 1.0,
+            use_ukf: true,
+            q_state: 1e-3,
+            q_param: 1e-6,
         }
     }
 }
@@ -107,7 +151,7 @@ fn normal_ppf(p: f64) -> f64 {
         -3.969683028665376e+01,
         2.209460984245205e+02,
         -2.759285104469687e+02,
-        1.383577518672690e+02,
+        1.383_577_518_672_69e2,
         -3.066479806614716e+01,
         2.506628277459239e+00,
     ];
@@ -275,6 +319,7 @@ impl AdaptiveAnomalyDetector {
     /// This is the "forgive slow drift, call out real change" loop that makes
     /// the detector usable for long-running monitoring (fermenters, ageing,
     /// sensor warm-up) without re-calibrating by hand.
+    #[allow(deprecated)]
     pub fn detect_drift_corrected(&mut self, reading: &[f64]) -> Result<DetectionResult> {
         if reading.len() != self.n_channels {
             return Err(OpenSmellError::InvalidChannelCount {
@@ -293,8 +338,8 @@ impl AdaptiveAnomalyDetector {
         let result = self.score(&smoothed);
         if !result.is_anomaly && self.baseline_n > 0 && self.config.drift_alpha > 0.0 {
             let a = self.config.drift_alpha;
-            for i in 0..self.n_channels {
-                self.baseline_mean[i] = (1.0 - a) * self.baseline_mean[i] + a * smoothed[i];
+            for (i, s) in smoothed.iter().enumerate() {
+                self.baseline_mean[i] = (1.0 - a) * self.baseline_mean[i] + a * s;
             }
             self.last_baseline_update = timestamp_now();
         }
@@ -380,7 +425,7 @@ impl AdaptiveAnomalyDetector {
         }
 
         // Retrain Platt scaling periodically
-        if self.feedback_history.len() % 10 == 0 {
+        if self.feedback_history.len().is_multiple_of(10) {
             self.retrain_platt_scaling();
         }
 
@@ -572,12 +617,23 @@ fn neg_log_likelihood(scores: &[f64], labels: &[f64], a: f64, b: f64) -> f64 {
         .sum()
 }
 
-/// Fail-safe system with redundant detectors and escalation.
+/// Fail-safe system with redundant detector budgets and escalation.
+///
+/// Wave-2: the detection core is the dual state/parameter Kalman engine
+/// (`crate::anomaly::DualKalmanEngine`), which replaces the legacy
+/// Welford/EWMA/windowed-Mahalanobis stack. The ensemble of three false-positive
+/// budgets is preserved on top of the engine's innovation scores, as are the
+/// warm-up, escalation, and sensor-health rules.
 #[derive(Debug, Clone)]
 pub struct FailSafeSystem {
     pub n_channels: usize,
-    pub detectors: Vec<AdaptiveAnomalyDetector>,
+    /// The dual-Kalman engine producing innovations, regimes, typology, and health.
+    pub engine: DualKalmanEngine,
     pub sensor_health: Vec<f64>,
+    /// Consecutive near-zero readings per channel; a channel must stay pinned at
+    /// zero for STUCK_ZERO_MIN_SAMPLES before it is flagged (and auto-recovers
+    /// the moment it reads a real value again).
+    pub zero_streaks: Vec<u32>,
     pub alert_level: u8,
     pub consecutive_anomalies: usize,
     pub consecutive_normal: usize,
@@ -587,7 +643,7 @@ pub struct FailSafeSystem {
     /// True once a baseline has been established (explicit calibration or a
     /// completed warm-up buffer). Detection is suppressed until this is set.
     pub baseline_ready: bool,
-    /// Operator-tunable detection behaviour, shared by all ensemble detectors.
+    /// Operator-tunable detection behaviour, shared by the engine.
     pub config: DetectionConfig,
 }
 
@@ -595,16 +651,19 @@ pub struct FailSafeSystem {
 /// detection on a newly-attached device.
 pub const WARMUP_SAMPLES: usize = 60;
 
+/// Consecutive near-zero readings (≈5 s @ 10 Hz) needed before a channel is
+/// declared "stuck at zero". A single transient 0.0 — an ADC glitch, a channel
+/// left unplugged for a moment — must not permanently degrade a sensor's
+/// health and lower the whole system's alert threshold.
+pub const STUCK_ZERO_MIN_SAMPLES: u32 = 50;
+
 impl FailSafeSystem {
     pub fn new(n_channels: usize) -> Self {
         let mut s = Self {
             n_channels,
-            detectors: vec![
-                AdaptiveAnomalyDetector::new(n_channels, 0.05),  // Standard
-                AdaptiveAnomalyDetector::new(n_channels, 0.01),  // Conservative
-                AdaptiveAnomalyDetector::new(n_channels, 0.10),  // Sensitive
-            ],
+            engine: DualKalmanEngine::new(n_channels),
             sensor_health: vec![1.0; n_channels],
+            zero_streaks: vec![0; n_channels],
             alert_level: 0,
             consecutive_anomalies: 0,
             consecutive_normal: 0,
@@ -616,9 +675,23 @@ impl FailSafeSystem {
         s
     }
 
-    /// Apply a detection configuration to every ensemble detector.
+    /// Provide an ambient model (on-board temperature/humidity response) so
+    /// weather-induced baseline shifts are predicted, not alarmed.
+    pub fn set_ambient_model(&mut self, ambient: AmbientModel) {
+        self.engine.set_ambient_model(ambient);
+    }
+
+    /// Establish a baseline from a calibration window (engine warm-start).
+    pub fn calibrate_baseline(&mut self, baseline_samples: &[Vec<f64>]) -> Result<()> {
+        self.engine.calibrate_baseline(baseline_samples)?;
+        self.baseline_ready = true;
+        self.baseline_samples.clear();
+        Ok(())
+    }
+
+    /// Apply a detection configuration to the engine.
     pub fn set_config(&mut self, config: DetectionConfig) {
-        self.config = config;
+        self.config = config.clone();
         self.propagate_config();
     }
 
@@ -628,89 +701,90 @@ impl FailSafeSystem {
     }
 
     fn propagate_config(&mut self) {
-        for detector in &mut self.detectors {
-            detector.set_config(self.config.clone());
-        }
+        let mut ec = self.engine.config.clone();
+        ec.sensitivity = self.config.sensitivity;
+        ec.q_state = self.config.q_state;
+        ec.q_param = self.config.q_param;
+        ec.state_filter = if self.config.use_ukf {
+            StateFilterKind::Unscented
+        } else {
+            StateFilterKind::Kalman
+        };
+        self.engine.set_config(ec);
     }
 
-    /// Fail-safe detection: if ANY detector triggers, we alert. Anomalies are
-    /// suppressed until a baseline is established so a freshly-attached device
-    /// doesn't scream "ANOMALY" while its mean/covariance are still unknown.
+    /// Fail-safe detection: anomalies are suppressed until a baseline is
+    /// established so a freshly-attached device doesn't scream "ANOMALY" while
+    /// its baseline is still unknown.
     pub fn detect(&mut self, reading: &[f64]) -> Result<FailSafeResult> {
-        // If a baseline wasn't calibrated up front, warm up from the live
-        // stream: buffer the first WARMUP_SAMPLES readings, then calibrate all
-        // detectors at once. Until then, report "warming up" and never anomaly.
+        self.detect_with_ambient(reading, None)
+    }
+
+    /// `detect` with on-board temperature/humidity when available.
+    pub fn detect_with_ambient(
+        &mut self,
+        reading: &[f64],
+        ambient: Option<AmbientReading>,
+    ) -> Result<FailSafeResult> {
+        // Warm-up: buffer the first WARMUP_SAMPLES readings, then calibrate the
+        // engine. Until then, report "warming up" and never anomaly.
         if !self.baseline_ready {
-            // An explicit/manual calibration already populated the detectors —
-            // treat that as ready and skip the deferred warm-up.
-            if self.detectors.iter().any(|d| d.baseline_n > 0) {
+            if self.engine.is_calibrated() {
                 self.baseline_ready = true;
             } else if self.baseline_samples.len() < WARMUP_SAMPLES {
                 self.baseline_samples.push(reading.to_vec());
                 if self.baseline_samples.len() == WARMUP_SAMPLES {
-                    let samples = self.baseline_samples.clone();
-                    for detector in &mut self.detectors {
-                        let _ = detector.calibrate_baseline(&samples);
+                    let samples = std::mem::take(&mut self.baseline_samples);
+                    // A failed calibration (e.g. a flat/constant stream →
+                    // singular covariance) must NOT mark the baseline ready:
+                    // scoring against a broken baseline makes every sample
+                    // "anomalous" — an alarm storm. Stay in warm-up and retry
+                    // on the next window instead.
+                    if self.engine.calibrate_baseline(&samples).is_ok() {
+                        self.baseline_ready = true;
                     }
-                    self.baseline_samples.clear();
-                    self.baseline_ready = true;
                 } else {
-                    return Ok(FailSafeResult {
-                        is_anomaly: false,
-                        anomaly_votes: 0,
-                        max_confidence: 0.0,
-                        raw_score: 0.0,
-                        calibrated_confidence: 0.0,
-                        triggered_channels: Vec::new(),
-                        max_delta: 0.0,
-                        alert_level: 0,
-                        alert_name: "warming_up".to_string(),
-                        consecutive_anomalies: 0,
-                        sensor_failures: Vec::new(),
-                        degraded_sensors: Vec::new(),
-                        warming_up: true,
-                        baseline_progress: self.baseline_samples.len() as f64 / WARMUP_SAMPLES as f64,
-                        smoothed: reading.to_vec(),
-                    });
+                    return Ok(self.warm_up_result(reading));
                 }
             } else {
                 self.baseline_ready = true;
             }
         }
 
-        let mut results = Vec::new();
-        let mut smoothed = Vec::new();
-        for detector in &mut self.detectors {
-            let r = detector.detect_drift_corrected(reading)?;
-            smoothed = detector.smoothed_state.clone().unwrap_or_default();
-            results.push(r);
-        }
+        let verdict: EngineVerdict = self.engine.detect(reading, ambient)?;
 
-        // Consensus: majority vote
-        let anomaly_votes = results.iter().filter(|r| r.is_anomaly).count();
+        // Consensus on the engine's three false-positive budgets.
+        let anomaly_votes = verdict.anomaly_votes;
         let mut is_anomaly = anomaly_votes >= 2;
 
-        // Worst-case: if any detector has very high confidence, alert — but only
-        // when at least one per-channel verdict also fired. The confidence is a
-        // Platt-scaled Mahalanobis distance, which blows up on poorly-conditioned
-        // covariance matrices; letting it veto an all-normal per-channel verdict
-        // would scream ANOMALY over noise.
-        let max_confidence = results.iter().map(|r| r.calibrated_confidence).fold(0.0f64, f64::max);
-        if anomaly_votes >= 1 && max_confidence > 0.9 {
+        // Confidence override: a strong multivariate deviation (Platt confidence
+        // on the innovation Mahalanobis) can fire with a single budget, but only
+        // when at least one per-channel innovation also moved.
+        let max_confidence = verdict.confidence;
+        if anomaly_votes >= 1 && max_confidence > 0.9 && verdict.max_z > 0.5 {
             is_anomaly = true;
         }
 
-        // Sensor health check: if any sensor is degraded, lower threshold
+        // Sensor health check: if any sensor is degraded, a single budget suffices.
         let degraded_sensors: Vec<usize> = self.sensor_health.iter().enumerate()
             .filter(|(_, &h)| h < 0.5)
             .map(|(i, _)| i)
             .collect();
-        
         if !degraded_sensors.is_empty() {
             is_anomaly = anomaly_votes >= 1;
         }
 
-        // Escalation logic
+        // Service alerts: a confirmed poison finding escalates regardless of the
+        // environment vote (the channel needs service, not a re-checksum).
+        let service_alert = verdict
+            .health_findings
+            .iter()
+            .any(|f| f.kind == HealthFindingKind::PoisonConfirmed);
+        if service_alert {
+            is_anomaly = true;
+        }
+
+        // Escalation logic (unchanged contract).
         if is_anomaly {
             self.consecutive_anomalies += 1;
             self.consecutive_normal = 0;
@@ -730,79 +804,131 @@ impl FailSafeSystem {
                 self.alert_level = 0;
             }
         }
+        if service_alert && self.alert_level < 2 {
+            self.alert_level = 2;
+        }
 
-        // Sensor failure detection
+        // Sensor failure detection (stuck/flatlined channels).
         let sensor_failures = self.detect_sensor_failures(reading);
 
         let alert_name = match self.alert_level {
             0 => "normal",
             1 => "warning",
-            2 => "critical",
-            3 => "emergency",
-            _ => "unknown",
-        }.to_string();
-
-        // Honest "how different is it?" answer for the operator: the raw
-        // Mahalanobis score and confidence of the strongest detector, plus the
-        // per-channel delta of the biggest deviation and which channels moved.
-        let raw_score = results.iter().map(|r| r.raw_score).fold(0.0f64, f64::max);
-        let calibrated_confidence = max_confidence;
-        let mut triggered_channels: Vec<usize> = Vec::new();
-        for r in &results {
-            for &ch in &r.triggered_channels {
-                if !triggered_channels.contains(&ch) {
-                    triggered_channels.push(ch);
+            2 => {
+                if service_alert {
+                    "service"
+                } else {
+                    "critical"
                 }
             }
+            3 => "emergency",
+            _ => "unknown",
         }
-        triggered_channels.sort_unstable();
-        let max_delta = results.iter()
-            .flat_map(|r| r.channel_scores.iter().copied())
-            .fold(0.0f64, f64::max);
+        .to_string();
 
         Ok(FailSafeResult {
             is_anomaly,
             anomaly_votes,
             max_confidence,
-            raw_score,
-            calibrated_confidence,
-            triggered_channels,
-            max_delta,
+            raw_score: verdict.raw_score,
+            calibrated_confidence: verdict.confidence,
+            triggered_channels: verdict.triggered_channels.clone(),
+            max_delta: verdict.max_z,
             alert_level: self.alert_level,
             alert_name,
             consecutive_anomalies: self.consecutive_anomalies,
             sensor_failures,
             degraded_sensors,
-            warming_up: false,
+            warming_up: verdict.warming_up,
             baseline_progress: 1.0,
-            smoothed,
+            smoothed: verdict.smoothed.clone(),
+            typology: verdict.typology.clone(),
+            regime_switch: verdict.regime_switch,
+            regime: verdict.regime,
+            relative_gains: verdict.relative_gains.clone(),
+            health_findings: verdict.health_findings.clone(),
         })
     }
 
+    fn warm_up_result(&self, reading: &[f64]) -> FailSafeResult {
+        FailSafeResult {
+            is_anomaly: false,
+            anomaly_votes: 0,
+            max_confidence: 0.0,
+            raw_score: 0.0,
+            calibrated_confidence: 0.0,
+            triggered_channels: Vec::new(),
+            max_delta: 0.0,
+            alert_level: 0,
+            alert_name: "warming_up".to_string(),
+            consecutive_anomalies: 0,
+            sensor_failures: Vec::new(),
+            degraded_sensors: Vec::new(),
+            warming_up: true,
+            baseline_progress: self.baseline_samples.len() as f64 / WARMUP_SAMPLES as f64,
+            smoothed: reading.to_vec(),
+            typology: None,
+            regime_switch: false,
+            regime: 0,
+            relative_gains: vec![1.0; self.n_channels],
+            health_findings: Vec::new(),
+        }
+    }
+
     /// Detect sensor failures BEFORE they cause missed anomalies.
+    ///
+    /// A channel must be pinned at exactly zero for STUCK_ZERO_MIN_SAMPLES
+    /// consecutive readings before it is declared dead — a single transient 0.0
+    /// (ADC glitch, one unplugged moment) must not permanently drop the channel
+    /// out of the health set and lower the whole system's alert threshold. The
+    /// channel auto-recovers (health restored to 1.0) the instant it reads a
+    /// real value again.
     fn detect_sensor_failures(&mut self, reading: &[f64]) -> Vec<SensorFailure> {
         let mut failures = Vec::new();
         for (ch, &value) in reading.iter().enumerate() {
-            // Check 1: stuck at zero
+            let Some(streak) = self.zero_streaks.get_mut(ch) else {
+                continue;
+            };
             if value.abs() < 1e-10 {
-                failures.push(SensorFailure {
-                    channel: ch,
-                    failure_type: "stuck_zero".to_string(),
-                    severity: "critical".to_string(),
-                    message: format!("Channel {} is stuck at zero — sensor may be disconnected", ch),
-                });
-                self.sensor_health[ch] = 0.0;
+                *streak += 1;
+                if *streak >= STUCK_ZERO_MIN_SAMPLES {
+                    // Flag only on the transition into the dead state, so a
+                    // flatlined channel doesn't re-report every single sample.
+                    let was_healthy = self.sensor_health[ch] > 0.5;
+                    self.sensor_health[ch] = 0.0;
+                    if was_healthy {
+                        failures.push(SensorFailure {
+                            channel: ch,
+                            failure_type: "stuck_zero".to_string(),
+                            severity: "critical".to_string(),
+                            message: format!("Channel {} is stuck at zero — sensor may be disconnected", ch),
+                        });
+                    }
+                }
+            } else {
+                // Recovered: any valid reading clears the streak and restores
+                // full health for this channel.
+                *streak = 0;
+                self.sensor_health[ch] = 1.0;
             }
         }
         failures
     }
 
-    /// Update all detectors with user feedback.
-    pub fn update_feedback(&mut self, reading: &[f64], was_anomaly: bool, note: &str) -> Result<()> {
-        for detector in &mut self.detectors {
-            detector.update_with_feedback(reading, was_anomaly, note)?;
-        }
+    /// Confirm the last reading's verdict with the operator: "did this matter?"
+    /// Retrains the Platt calibration per the Lin et al. schedule.
+    pub fn update_feedback(&mut self, was_anomaly: bool, _note: &str) -> Result<()> {
+        self.engine.confirm(was_anomaly);
         Ok(())
+    }
+
+    /// Direct the engine to record an operator-initiated reference stimulus.
+    pub fn record_stimulus(
+        &mut self,
+        channel_response: &[f64],
+        expected_ref: &[f64],
+    ) -> Result<Vec<HealthFinding>> {
+        self.engine.record_stimulus(channel_response, expected_ref)
     }
 }
 
@@ -833,6 +959,23 @@ pub struct FailSafeResult {
     pub baseline_progress: f64,
     /// EWMA-smoothed copy of this reading, per channel (matches what was scored).
     pub smoothed: Vec<f64>,
+    /// What kind of change was classified (spike/step/ramp/pulse), when one has
+    /// taken shape on the innovation stream.
+    #[serde(default)]
+    pub typology: Option<Typology>,
+    /// True when the multi-regime model declared an *expected* transition
+    /// (environment changed regime — not an anomaly).
+    #[serde(default)]
+    pub regime_switch: bool,
+    /// Current regime index.
+    #[serde(default)]
+    pub regime: usize,
+    /// Parameter filter's retained sensor gain per channel (g/g0).
+    #[serde(default)]
+    pub relative_gains: Vec<f64>,
+    /// Health findings from stimulus/parameter reconciliation (e.g. poisoning).
+    #[serde(default)]
+    pub health_findings: Vec<HealthFinding>,
 }
 
 /// Sensor failure record.
@@ -1141,9 +1284,7 @@ mod tests {
         ];
         
         let mut system = FailSafeSystem::new(3);
-        for detector in &mut system.detectors {
-            detector.calibrate_baseline(&baseline).unwrap();
-        }
+        system.calibrate_baseline(&baseline).unwrap();
         
         // Normal reading
         let result = system.detect(&vec![1.0, 2.0, 3.0]).unwrap();
@@ -1209,12 +1350,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_smoothing_damps_single_sample_spike() {
         let baseline = vec![vec![1.0, 2.0], vec![1.1, 2.1], vec![0.9, 1.9], vec![1.05, 2.05]];
         let mut detector = AdaptiveAnomalyDetector::new(2, 0.05);
         detector.calibrate_baseline(&baseline).unwrap();
         // Heavy smoothing: a one-sample spike must not fire the detector.
-        detector.set_config(DetectionConfig { smoothing_alpha: 0.1, drift_alpha: 0.0, sensitivity: 1.0 });
+        detector.set_config(DetectionConfig { smoothing_alpha: 0.1, drift_alpha: 0.0, sensitivity: 1.0, ..Default::default() });
 
         // Normal reading warms the smoother onto the baseline nominal value.
         detector.detect_drift_corrected(&[1.0, 2.0]).unwrap();
@@ -1234,58 +1376,92 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_drift_correction_absorbs_slow_env_change_folder() {
         let baseline = vec![vec![1.0, 2.0], vec![1.1, 2.1], vec![0.9, 1.9], vec![1.05, 2.05]];
         let mut system = FailSafeSystem::new(2);
-        for detector in &mut system.detectors {
-            detector.calibrate_baseline(&baseline).unwrap();
-        }
-        // Aggressive (but slow-vs-streaming) drift correction enabled.
-        system.set_config(DetectionConfig { smoothing_alpha: 1.0, drift_alpha: 0.02, sensitivity: 1.0 });
+        system.calibrate_baseline(&baseline).unwrap();
+        // The engine absorbs slow drift through its parameter walk; `q_param`
+        // is the drift-tracking rate (the legacy `drift_alpha` is ignored by it).
+        system.set_config(DetectionConfig {
+            smoothing_alpha: 1.0,
+            drift_alpha: 0.02,
+            sensitivity: 1.0,
+            q_param: 2e-4,
+            ..DetectionConfig::default()
+        });
         assert!(!system.detect(&[1.0, 2.0]).unwrap().is_anomaly);
 
-        // Ramp the "true" value +3 over many normal samples: with drift
-        // correction the baseline chases it, so by the end it reads as normal.
+        // Ramp the "true" value +3 over many normal samples: with the parameter
+        // walk enabled the baseline chases it, so by the end it reads as normal.
         for i in 0..300 {
             let v = 1.0 + 3.0 * (i as f64 / 300.0);
             let r = system.detect(&[v, 2.0 + v - 1.0]).unwrap();
-            assert!(!r.is_anomaly, "slow ramp must be forgiven by EWMA drift correction");
+            assert!(!r.is_anomaly, "slow ramp must be forgiven by drift tracking");
         }
         // After the drift-followed ramp, a *step* beyond the chased level (not
         // a continuation) must still be flagged — a real event, not drift.
         assert!(system.detect(&[6.0, 7.0]).unwrap().is_anomaly,
             "an abrupt step after the ramp must still be flagged");
 
-        // Disable drift: the frozen baseline now calls the drifted normal state
-        // an anomaly — proving drift correction is what made the ramp pass.
+        // Disable the parameter walk: the frozen baseline now calls the drifted
+        // normal state an anomaly — proving the walk is what made the ramp pass.
         let mut frozen = FailSafeSystem::new(2);
-        for detector in &mut frozen.detectors {
-            detector.calibrate_baseline(&baseline).unwrap();
-        }
-        frozen.set_config(DetectionConfig { smoothing_alpha: 1.0, drift_alpha: 0.0, sensitivity: 1.0 });
+        frozen.calibrate_baseline(&baseline).unwrap();
+        frozen.set_config(DetectionConfig {
+            smoothing_alpha: 1.0,
+            drift_alpha: 0.0,
+            sensitivity: 1.0,
+            q_param: 0.0,
+            ..DetectionConfig::default()
+        });
         assert!(!frozen.detect(&[1.0, 2.0]).unwrap().is_anomaly);
         let r = frozen.detect(&[4.0, 5.0]).unwrap();
-        assert!(r.is_anomaly, "without drift correction the same shift should alarm");
+        assert!(r.is_anomaly, "without drift tracking the same shift should alarm");
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_sensitivity_is_the_how_much_control() {
-        let baseline = vec![vec![1.0, 2.0], vec![1.1, 2.1], vec![0.9, 1.9], vec![1.05, 2.05]];
-        let mut strict = FailSafeSystem::new(2);
-        for detector in &mut strict.detectors {
-            detector.calibrate_baseline(&baseline).unwrap();
+        // Baseline noise σ ≈ 0.035 (from the tilted calibration window); a
+        // +0.12 deviation is ≈3σ — sub-threshold at low sensitivity, obvious at
+        // high sensitivity. (The legacy test used +0.8 against an absolute
+        // sensor-unit threshold; the engine works in calibrated-σ units, and the
+        // *control semantics* — low requires more, high catches the same — are
+        // identical.)
+        let baseline: Vec<Vec<f64>> = (0..80)
+            .map(|i| {
+                let n = i as f64;
+                vec![1.0 + 0.05 * (n * 1.7).sin(), 2.0 + 0.05 * (n * 1.7).sin()]
+            })
+            .collect();
+        let mk = |sens: f64| -> FailSafeSystem {
+            let mut s = FailSafeSystem::new(2);
+            s.set_config(DetectionConfig {
+                sensitivity: sens,
+                smoothing_alpha: 1.0,
+                drift_alpha: 0.0,
+                q_state: 1e-4,
+                ..DetectionConfig::default()
+            });
+            s.calibrate_baseline(&baseline).unwrap();
+            s
+        };
+        let delta = [1.12, 2.0];
+        let mut strict = mk(0.5);
+        for _ in 0..30 {
+            let _ = strict.detect(&[1.0, 2.0]).unwrap();
         }
-        strict.set_config(DetectionConfig { smoothing_alpha: 1.0, drift_alpha: 0.0, sensitivity: 0.5 });
         assert!(!strict.detect(&[1.0, 2.0]).unwrap().is_anomaly);
-        // A small deviation (+0.8) is ignored at low sensitivity.
-        assert!(!strict.detect(&[1.8, 2.0]).unwrap().is_anomaly, "low sensitivity must tolerate small deltas");
-
-        let mut sensitive = FailSafeSystem::new(2);
-        for detector in &mut sensitive.detectors {
-            detector.calibrate_baseline(&baseline).unwrap();
+        // A small deviation (+0.12) is ignored at low sensitivity.
+        assert!(!strict.detect(&delta).unwrap().is_anomaly,
+            "low sensitivity must tolerate the ~3σ delta");
+        let mut sensitive = mk(4.0);
+        for _ in 0..30 {
+            let _ = sensitive.detect(&[1.0, 2.0]).unwrap();
         }
-        sensitive.set_config(DetectionConfig { smoothing_alpha: 1.0, drift_alpha: 0.0, sensitivity: 4.0 });
         assert!(!sensitive.detect(&[1.0, 2.0]).unwrap().is_anomaly);
-        assert!(sensitive.detect(&[1.8, 2.0]).unwrap().is_anomaly, "high sensitivity must call out the same delta");
+        assert!(sensitive.detect(&delta).unwrap().is_anomaly,
+            "high sensitivity must call out the same delta");
     }
 }

@@ -2,6 +2,90 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use crate::{Result, OpenSmellError};
 
+pub mod linalg;
+pub mod filter;
+pub mod regimes;
+pub mod typology;
+pub mod platt;
+pub mod stimulus;
+pub mod dual;
+pub mod replay;
+pub mod adapters;
+pub mod ewma;
+
+pub use dual::{
+    AdsorptionConfig, AmbientModel, AmbientReading, DualKalmanEngine, EngineConfig,
+    EngineVerdict, ResponseConfig,
+};
+pub use ewma::{EwmaConfig, EwmaControlChart, EwmaVerdict};
+pub use adapters::{
+    FermentationAdapter, FermentationStage, ProcessAdapter, ProcessEvent, ProcessEventKind,
+};
+pub use replay::{ConfusionBin, ReplayMetrics, ReplayReport, ReplayVerdict, Sample, SampleTruth};
+pub use filter::{KalmanFilterImpl, StateFilterKind, UkfParams, UpdateOutcome};
+pub use platt::{PlattCalibrator, PlattParams};
+pub use regimes::{RegimeCluster, RegimeConfig, RegimeModel, RegimeTransition, RegimeUpdate};
+pub use stimulus::{HealthFinding, HealthFindingKind, StimulusConfig, StimulusGainTracker, StimulusMeasurement};
+pub use typology::{Typology, TypologyConfig, TypologyHead, TypologyKind};
+
+/// Streamlined, detector-agnostic verdict shared by the replay evaluators.
+#[derive(Debug, Clone)]
+pub struct StreamVerdict {
+    pub is_anomaly: bool,
+    pub kind: Option<String>,
+    pub max_z: f64,
+}
+
+/// Either the shipping engine or the EWMA control chart, behind one interface
+/// so the replay bins (`realdata_eval`, `indoor_eval`) score both detectors
+/// with identical windows and margins.
+#[derive(Debug)]
+pub enum StreamDetector {
+    Dual(DualKalmanEngine),
+    Ewma(EwmaControlChart),
+}
+
+impl StreamDetector {
+    pub fn dual(n_channels: usize, sensitivity: f64) -> Self {
+        let mut e = DualKalmanEngine::new(n_channels);
+        e.config.sensitivity = sensitivity;
+        Self::Dual(e)
+    }
+
+    pub fn ewma(n_channels: usize, config: EwmaConfig) -> Self {
+        Self::Ewma(EwmaControlChart::with_config(n_channels, config))
+    }
+
+    pub fn calibrate(&mut self, samples: &[Vec<f64>]) -> Result<()> {
+        match self {
+            Self::Dual(e) => e.calibrate_baseline(samples),
+            Self::Ewma(e) => e.calibrate(samples),
+        }
+    }
+
+    pub fn detect(&mut self, reading: &[f64]) -> Result<StreamVerdict> {
+        match self {
+            Self::Dual(e) => {
+                let v = e.detect_no_ambient(reading)?;
+                Ok(StreamVerdict {
+                    is_anomaly: v.is_anomaly,
+                    kind: v.typology.as_ref().map(|t| t.kind.as_str().to_string()),
+                    max_z: v.max_z,
+                })
+            }
+            Self::Ewma(e) => {
+                let v = e.detect(reading)?;
+                e.update(reading);
+                Ok(StreamVerdict {
+                    is_anomaly: v.is_anomaly,
+                    kind: Some("ewma".to_string()),
+                    max_z: v.max_z,
+                })
+            }
+        }
+    }
+}
+
 /// Anomaly score with explanation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnomalyScore {

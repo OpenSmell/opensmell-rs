@@ -86,7 +86,7 @@ impl Baseline {
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .collect();
             vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let median = if vals.len() % 2 == 0 {
+            let median = if vals.len().is_multiple_of(2) {
                 (vals[vals.len() / 2 - 1] + vals[vals.len() / 2]) / 2.0
             } else {
                 vals[vals.len() / 2]
@@ -124,7 +124,7 @@ pub mod live;
 pub mod smellability;
 pub use features::{FeatureGroup, extract_features, extract_window_features, feature_names};
 pub use anomaly::{AnomalyDetector, AnomalyScore, AnomalyMethod};
-pub use calibration::{Calibrator, CalibrationProfile, CrossDeviceCalibrator};
+pub use calibration::{AutoTune, Calibrator, CalibrationProfile, CrossDeviceCalibrator};
 pub use health::{HealthMonitor, SensorHealth, HealthStatus, FleetHealth, fisher_discriminant_ratio, pairwise_fdr, euclidean_distance, cosine_similarity, similarity_warning};
 pub use protocol::{OsmProtocol, OsmMessage};
 pub use preprocessing::{RawData, BaselineCorrection, BaselineMethod, SignalFilter, FilterType, WindowExtractor, DataValidator};
