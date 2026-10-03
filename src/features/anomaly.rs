@@ -49,6 +49,13 @@ pub fn extract(normalized: &[f64], raw: &[f64], baseline: &Baseline) -> Result<V
 
 /// Extract anomaly features from a time series window (for continuous monitoring).
 pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f64>> {
+    extract_window_sr(window, baseline, crate::features::DEFAULT_FEATURE_SR)
+}
+
+/// [`extract_window`] with an explicit sampling rate `sr` (Hz) so time-derived
+/// features (drift rate) are expressed per second regardless of cadence.
+pub fn extract_window_sr(window: &[Vec<f64>], baseline: &Baseline, sr: f64) -> Result<Vec<f64>> {
+    let fs = if sr.is_finite() { sr.abs() } else { 1e-9 }.max(1e-9);
     if window.len() < 2 {
         return Err(OpenSmellError::InsufficientData { expected: 2, actual: window.len() });
     }
@@ -65,7 +72,9 @@ pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f6
         let raw_vals: Vec<f64> = window.iter().map(|s| s[ch]).collect();
         let n = vals.len() as f64;
 
-        // 1. Drift rate: slope of linear fit to normalized values
+        // 1. Drift rate: slope of linear fit to normalized values vs the time
+        // axis (sample index / fs); the per-sample slope is scaled by fs so the
+        // rate is per second — cadence-independent.
         let mean_x = (n - 1.0) / 2.0;
         let mean_y: f64 = vals.iter().sum::<f64>() / n;
         let mut ss_xy = 0.0;
@@ -75,7 +84,7 @@ pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f6
             ss_xy += dx * (v - mean_y);
             ss_xx += dx * dx;
         }
-        let drift_rate = if ss_xx > 0.0 { ss_xy / ss_xx } else { 0.0 };
+        let drift_rate = if ss_xx > 0.0 { ss_xy / ss_xx * fs } else { 0.0 };
         features.push(drift_rate);
 
         // 2. Stability: inverse of coefficient of variation

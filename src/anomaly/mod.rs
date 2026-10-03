@@ -34,6 +34,10 @@ pub struct StreamVerdict {
     pub is_anomaly: bool,
     pub kind: Option<String>,
     pub max_z: f64,
+    /// Per-channel z-scores the engine saw (Dual only; empty for EWMA).
+    pub z_scores: Vec<f64>,
+    /// How many of the three budgets fired (Dual only; 0 for EWMA).
+    pub anomaly_votes: usize,
 }
 
 /// Either the shipping engine or the EWMA control chart, behind one interface
@@ -46,6 +50,15 @@ pub enum StreamDetector {
 }
 
 impl StreamDetector {
+    /// The engine's current full config (physics + decision knobs). Used to
+    /// snapshot a fitted config for cross-device transfer experiments.
+    pub fn engine_config(&self) -> Option<EngineConfig> {
+        match self {
+            Self::Dual(e) => Some(e.config.clone()),
+            Self::Ewma(_) => None,
+        }
+    }
+
     pub fn dual(n_channels: usize, sensitivity: f64) -> Self {
         let mut e = DualKalmanEngine::new(n_channels);
         e.config.sensitivity = sensitivity;
@@ -71,6 +84,8 @@ impl StreamDetector {
                     is_anomaly: v.is_anomaly,
                     kind: v.typology.as_ref().map(|t| t.kind.as_str().to_string()),
                     max_z: v.max_z,
+                    z_scores: v.z_scores,
+                    anomaly_votes: v.anomaly_votes,
                 })
             }
             Self::Ewma(e) => {
@@ -80,6 +95,39 @@ impl StreamDetector {
                     is_anomaly: v.is_anomaly,
                     kind: Some("ewma".to_string()),
                     max_z: v.max_z,
+                    z_scores: Vec::new(),
+                    anomaly_votes: 0,
+                })
+            }
+        }
+    }
+
+    /// Detect one reading with its real inter-sample gap `dt_s`, so the
+    /// detector's physical process model (process noise, adsorption decay,
+    /// smoothing constant) matches the actual stream cadence. This is how a
+    /// field logger that samples at anything but the reference 10 Hz should be
+    /// driven.
+    pub fn detect_with_dt(&mut self, reading: &[f64], dt_s: f64) -> Result<StreamVerdict> {
+        match self {
+            Self::Dual(e) => {
+                let v = e.detect_with_dt(reading, None, dt_s)?;
+                Ok(StreamVerdict {
+                    is_anomaly: v.is_anomaly,
+                    kind: v.typology.as_ref().map(|t| t.kind.as_str().to_string()),
+                    max_z: v.max_z,
+                    z_scores: v.z_scores,
+                    anomaly_votes: v.anomaly_votes,
+                })
+            }
+            Self::Ewma(e) => {
+                let v = e.detect_with_dt(reading, dt_s)?;
+                e.update_with_dt(reading, dt_s);
+                Ok(StreamVerdict {
+                    is_anomaly: v.is_anomaly,
+                    kind: Some("ewma".to_string()),
+                    max_z: v.max_z,
+                    z_scores: Vec::new(),
+                    anomaly_votes: 0,
                 })
             }
         }

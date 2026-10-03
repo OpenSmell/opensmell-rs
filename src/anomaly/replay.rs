@@ -16,20 +16,29 @@ pub struct SampleTruth {
     pub onset: Option<u64>,
 }
 
-/// One sample of a replay stream: the reading, optional ambient, and the
-/// ground-truth label used only for scoring (not fed to the engine).
+/// One sample of a replay stream: the reading, optional ambient, the ground-
+/// truth label used only for scoring (not fed to the engine), and the optional
+/// real inter-sample gap in seconds. `dt_s = None` lets the engine's configured
+/// reference cadence apply (the legacy 10 Hz behaviour).
 #[derive(Debug, Clone, Default)]
 pub struct Sample {
     pub reading: Vec<f64>,
     pub temperature: Option<f64>,
     pub humidity: Option<f64>,
+    pub dt_s: Option<f64>,
     pub truth: Option<SampleTruth>,
 }
 
 impl Sample {
     /// Build a plain (unlabeled) sample — used for calibration or blind sweeps.
     pub fn new(reading: Vec<f64>) -> Self {
-        Self { reading, temperature: None, humidity: None, truth: None }
+        Self { reading, temperature: None, humidity: None, dt_s: None, truth: None }
+    }
+
+    /// Attach the real seconds elapsed since the previous sample.
+    pub fn with_dt(mut self, dt_s: f64) -> Self {
+        self.dt_s = Some(dt_s);
+        self
     }
 
     /// Attach a ground-truth label.
@@ -77,6 +86,10 @@ pub struct ReplayMetrics {
     /// Mean detection latency in samples (first flag ≥ onset − onset), over
     /// the events that were detected in time.
     pub latency_samples: Option<f64>,
+    /// Mean detection latency in wall-clock seconds (sum of the per-sample
+    /// `dt_s` over the latency window), over the same detected events. Only
+    /// populated when the samples carry real cadence.
+    pub latency_seconds: Option<f64>,
 }
 
 impl ReplayMetrics {
@@ -112,13 +125,18 @@ impl DualKalmanEngine {
     {
         let mut report = ReplayReport::default();
         let mut latencies: Vec<u64> = Vec::new();
+        // Actual per-sample dt used (seconds), for wall-clock latency and so the
+        // engine's process model matches the real cadence.
+        let mut wall_seconds: Vec<f64> = Vec::new();
         // Pending labeled events: (onset, first-hit index, closed?).
         let mut pending_onsets: Vec<(u64, Option<u64>)> = Vec::new();
 
         for (index, sample) in (0u64..).zip(samples) {
             let reading = sample.reading.clone();
             let ambient = ambient_option(sample);
-            let verdict = self.detect(&reading, ambient).map_err(|e| {
+            let dt_s = sample.dt_s.unwrap_or(self.config.sample_period_s.max(1e-4));
+            wall_seconds.push(dt_s);
+            let verdict = self.detect_with_dt(&reading, ambient, dt_s).map_err(|e| {
                 OpenSmellError::AnomalyDetection(format!(
                     "replay sample {index}: {e}"
                 ))
@@ -165,15 +183,25 @@ impl DualKalmanEngine {
         }
 
         // Sweep the closed latencies.
+        let mut latencies_sec: Vec<f64> = Vec::new();
         for (onset, first_hit) in pending_onsets {
             if let Some(hit) = first_hit {
                 report.metrics.detected_events += 1;
                 latencies.push(hit - onset);
+                if (onset as usize) < wall_seconds.len() && (hit as usize) < wall_seconds.len() {
+                    latencies_sec.push(
+                        wall_seconds[onset as usize..=hit as usize].iter().sum::<f64>(),
+                    );
+                }
             }
         }
         if !latencies.is_empty() {
             report.metrics.latency_samples =
                 Some(latencies.iter().sum::<u64>() as f64 / latencies.len() as f64);
+        }
+        if !latencies_sec.is_empty() {
+            report.metrics.latency_seconds =
+                Some(latencies_sec.iter().sum::<f64>() / latencies_sec.len() as f64);
         }
         if report.metrics.n_samples == 0 && report.verdicts.is_empty() {
             // Empty stream ⇒ not an error, but nothing was scored.

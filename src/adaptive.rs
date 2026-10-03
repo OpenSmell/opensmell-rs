@@ -630,16 +630,32 @@ pub struct FailSafeSystem {
     /// The dual-Kalman engine producing innovations, regimes, typology, and health.
     pub engine: DualKalmanEngine,
     pub sensor_health: Vec<f64>,
-    /// Consecutive near-zero readings per channel; a channel must stay pinned at
-    /// zero for STUCK_ZERO_MIN_SAMPLES before it is flagged (and auto-recovers
-    /// the moment it reads a real value again).
-    pub zero_streaks: Vec<u32>,
+    /// Accumulated wall-clock seconds each channel has stayed pinned at zero;
+    /// a channel must stay at zero for STUCK_ZERO_SECONDS of *real time*
+    /// (cadence-agnostic — 5 s on a 2 Hz rig equals ~10 readings, on a 25 Hz
+    /// logger ~125) before it is flagged (and auto-recovers the moment it
+    /// reads a real value again).
+    pub zero_streaks: Vec<f64>,
     pub alert_level: u8,
+    /// Consecutive anomalous readings (informational; cadence-specific). The
+    /// escalation *decision* uses the wall-clock `anomalous_seconds` below so a
+    /// slow-logged stream escalates after the same physical time.
     pub consecutive_anomalies: usize,
+    /// Consecutive normal readings (informational; cadence-specific).
     pub consecutive_normal: usize,
+    /// Wall-clock during which readings have been continuously anomalous —
+    /// drives the warning/critical/emergency escalation, so a 6 s TADI logger
+    /// reaches Emergency after the same *seconds* of sustained anomaly a 10 Hz
+    /// stream would (60 uninterrupted 10 Hz samples).
+    pub anomalous_seconds: f64,
+    /// Wall-clock during which readings have been continuously normal — drives
+    /// the clear-after-resolution rule.
+    pub normal_seconds: f64,
     /// Collected-but-unused warm-up samples used to establish a baseline when
     /// none was provided before streaming (kills plug-in false positives).
     pub baseline_samples: Vec<Vec<f64>>,
+    /// Accumulated wall-clock during warm-up (drives `baseline_progress`).
+    pub warmup_time: f64,
     /// True once a baseline has been established (explicit calibration or a
     /// completed warm-up buffer). Detection is suppressed until this is set.
     pub baseline_ready: bool,
@@ -647,15 +663,36 @@ pub struct FailSafeSystem {
     pub config: DetectionConfig,
 }
 
-/// Number of fresh stream readings to collect before auto-enabling anomaly
-/// detection on a newly-attached device.
-pub const WARMUP_SAMPLES: usize = 60;
+/// Number of wall-clock seconds of fresh stream readings to collect before
+/// auto-enabling anomaly detection on a newly-attached device. The engine
+/// (`anomaly::dual`) uses the same 6 s warm-up, so a remotely- or
+/// locally-driven device settles at the same physical point.
+pub const WARMUP_SECONDS: f64 = 6.0;
 
-/// Consecutive near-zero readings (≈5 s @ 10 Hz) needed before a channel is
-/// declared "stuck at zero". A single transient 0.0 — an ADC glitch, a channel
-/// left unplugged for a moment — must not permanently degrade a sensor's
-/// health and lower the whole system's alert threshold.
-pub const STUCK_ZERO_MIN_SAMPLES: u32 = 50;
+/// Wall-clock time a channel must sit at exactly zero before it is declared
+/// "stuck at zero". Being a *time*, not a sample count, it is cadence-agnostic:
+/// 5 s is ~10 readings on the 2 Hz rig and ~125 readings on a 25 Hz logger,
+/// and a slow-logged stream still flags a genuinely dead channel after the
+/// same physical 5 s. A single transient 0.0 — an ADC glitch, a channel left
+/// unplugged for a moment — must not permanently degrade a sensor's health and
+/// lower the whole system's alert threshold.
+pub const STUCK_ZERO_SECONDS: f64 = 5.0;
+
+/// Wall-clock seconds of *continuous anomaly* before the alert escalates to
+/// warning. Quoted as physical time so a slow-logged stream (e.g. the ~6 s
+/// TADI loggers) escalates after the same seconds a 10 Hz stream would
+/// (2 samples at 10 Hz = 0.2 s).
+pub const WARNING_SECONDS: f64 = 0.2;
+
+/// Wall-clock seconds of continuous anomaly before critical.
+pub const CRITICAL_SECONDS: f64 = 0.5;
+
+/// Wall-clock seconds of continuous anomaly before emergency.
+pub const EMERGENCY_SECONDS: f64 = 1.0;
+
+/// Wall-clock seconds of continuous *normal* readings before a raised alert
+/// clears (the old contract was 20 samples at the reference 10 Hz = 2.0 s).
+pub const RESET_NORMAL_SECONDS: f64 = 2.0;
 
 impl FailSafeSystem {
     pub fn new(n_channels: usize) -> Self {
@@ -663,11 +700,14 @@ impl FailSafeSystem {
             n_channels,
             engine: DualKalmanEngine::new(n_channels),
             sensor_health: vec![1.0; n_channels],
-            zero_streaks: vec![0; n_channels],
+            zero_streaks: vec![0.0; n_channels],
             alert_level: 0,
             consecutive_anomalies: 0,
             consecutive_normal: 0,
+            anomalous_seconds: 0.0,
+            normal_seconds: 0.0,
             baseline_samples: Vec::new(),
+            warmup_time: 0.0,
             baseline_ready: false,
             config: DetectionConfig::default(),
         };
@@ -713,11 +753,31 @@ impl FailSafeSystem {
         self.engine.set_config(ec);
     }
 
+    /// The reference inter-sample gap the engine assumes when no real clock is
+    /// supplied (matches `DualKalmanEngine::detect`'s own fallback).
+    fn reference_dt_s(&self) -> f64 {
+        self.engine.config.sample_period_s.max(1e-4)
+    }
+
+    /// The reference inter-sample gap in seconds (public accessor; the caller
+    /// that owns the wall-clock uses this as the first-reading cadence).
+    pub fn sample_period_s(&self) -> f64 {
+        self.reference_dt_s()
+    }
+
     /// Fail-safe detection: anomalies are suppressed until a baseline is
     /// established so a freshly-attached device doesn't scream "ANOMALY" while
     /// its baseline is still unknown.
     pub fn detect(&mut self, reading: &[f64]) -> Result<FailSafeResult> {
-        self.detect_with_ambient(reading, None)
+        let dt_s = self.reference_dt_s();
+        self.detect_with_ambient_and_dt(reading, None, dt_s)
+    }
+
+    /// `detect` at the reading's *actual* inter-sample gap `dt_s` (real clock),
+    /// mirroring the engine's continuous-time semantics. Warm-up is a sample
+    /// count; scoring is cadence-aware.
+    pub fn detect_with_dt(&mut self, reading: &[f64], dt_s: f64) -> Result<FailSafeResult> {
+        self.detect_with_ambient_and_dt(reading, None, dt_s)
     }
 
     /// `detect` with on-board temperature/humidity when available.
@@ -726,20 +786,37 @@ impl FailSafeSystem {
         reading: &[f64],
         ambient: Option<AmbientReading>,
     ) -> Result<FailSafeResult> {
-        // Warm-up: buffer the first WARMUP_SAMPLES readings, then calibrate the
-        // engine. Until then, report "warming up" and never anomaly.
+        let dt_s = self.reference_dt_s();
+        self.detect_with_ambient_and_dt(reading, ambient, dt_s)
+    }
+
+    /// `detect_with_ambient` at a real inter-sample gap `dt_s`.
+    pub fn detect_with_ambient_and_dt(
+        &mut self,
+        reading: &[f64],
+        ambient: Option<AmbientReading>,
+        dt_s: f64,
+    ) -> Result<FailSafeResult> {
+        // Warm-up: buffer readings for the first WARMUP_SECONDS (wall-clock) of
+        // the stream, then calibrate the engine — the same physical settling
+        // window the anomaly engine itself uses across cadences. Until then,
+        // report "warming up" and never anomaly.
         if !self.baseline_ready {
             if self.engine.is_calibrated() {
                 self.baseline_ready = true;
-            } else if self.baseline_samples.len() < WARMUP_SAMPLES {
+            } else if self.baseline_samples.is_empty() || self.warmup_time < WARMUP_SECONDS {
                 self.baseline_samples.push(reading.to_vec());
-                if self.baseline_samples.len() == WARMUP_SAMPLES {
+                self.warmup_time += dt_s;
+                // Calibrate as soon as a full warm-up window has elapsed. A
+                // failed calibration (e.g. a flat/constant stream → singular
+                // covariance) must NOT mark the baseline ready: scoring against
+                // a broken baseline makes every sample "anomalous" — an alarm
+                // storm. Stay in warm-up and retry on the next window instead.
+                if !self.engine.is_calibrated()
+                    && self.warmup_time + 1e-9 >= WARMUP_SECONDS
+                    && self.baseline_samples.len() >= 2
+                {
                     let samples = std::mem::take(&mut self.baseline_samples);
-                    // A failed calibration (e.g. a flat/constant stream →
-                    // singular covariance) must NOT mark the baseline ready:
-                    // scoring against a broken baseline makes every sample
-                    // "anomalous" — an alarm storm. Stay in warm-up and retry
-                    // on the next window instead.
                     if self.engine.calibrate_baseline(&samples).is_ok() {
                         self.baseline_ready = true;
                     }
@@ -751,7 +828,7 @@ impl FailSafeSystem {
             }
         }
 
-        let verdict: EngineVerdict = self.engine.detect(reading, ambient)?;
+        let verdict: EngineVerdict = self.engine.detect_with_dt(reading, ambient, dt_s)?;
 
         // Consensus on the engine's three false-positive budgets.
         let anomaly_votes = verdict.anomaly_votes;
@@ -784,15 +861,23 @@ impl FailSafeSystem {
             is_anomaly = true;
         }
 
-        // Escalation logic (unchanged contract).
+        // Escalation logic. Alert levels are reached after a wall-clock
+        // *duration* (`anomalous_seconds`) of continuous anomaly, not a sample
+        // count — a 6 s TADI logger escalates after the same physical seconds
+        // of sustained anomaly a 10 Hz stream would. The legacy sample-count
+        // fields (`consecutive_*`) still mirror this decision for observability
+        // so callers observing the counter see a wall-clock-equivalent series
+        // (10 Hz == old 10/5/2/20-sample thresholds).
         if is_anomaly {
             self.consecutive_anomalies += 1;
             self.consecutive_normal = 0;
-            self.alert_level = if self.consecutive_anomalies >= 10 {
+            self.anomalous_seconds += dt_s;
+            self.normal_seconds = 0.0;
+            self.alert_level = if self.anomalous_seconds + 1e-9 >= EMERGENCY_SECONDS {
                 3  // Emergency
-            } else if self.consecutive_anomalies >= 5 {
+            } else if self.anomalous_seconds + 1e-9 >= CRITICAL_SECONDS {
                 2  // Critical
-            } else if self.consecutive_anomalies >= 2 {
+            } else if self.anomalous_seconds + 1e-9 >= WARNING_SECONDS {
                 1  // Warning
             } else {
                 self.alert_level
@@ -800,7 +885,9 @@ impl FailSafeSystem {
         } else {
             self.consecutive_normal += 1;
             self.consecutive_anomalies = 0;
-            if self.consecutive_normal >= 20 {
+            self.normal_seconds += dt_s;
+            self.anomalous_seconds = 0.0;
+            if self.normal_seconds + 1e-9 >= RESET_NORMAL_SECONDS {
                 self.alert_level = 0;
             }
         }
@@ -809,7 +896,7 @@ impl FailSafeSystem {
         }
 
         // Sensor failure detection (stuck/flatlined channels).
-        let sensor_failures = self.detect_sensor_failures(reading);
+        let sensor_failures = self.detect_sensor_failures(reading, dt_s);
 
         let alert_name = match self.alert_level {
             0 => "normal",
@@ -837,6 +924,7 @@ impl FailSafeSystem {
             alert_level: self.alert_level,
             alert_name,
             consecutive_anomalies: self.consecutive_anomalies,
+            anomalous_seconds: self.anomalous_seconds,
             sensor_failures,
             degraded_sensors,
             warming_up: verdict.warming_up,
@@ -862,10 +950,11 @@ impl FailSafeSystem {
             alert_level: 0,
             alert_name: "warming_up".to_string(),
             consecutive_anomalies: 0,
+            anomalous_seconds: 0.0,
             sensor_failures: Vec::new(),
             degraded_sensors: Vec::new(),
             warming_up: true,
-            baseline_progress: self.baseline_samples.len() as f64 / WARMUP_SAMPLES as f64,
+            baseline_progress: (self.warmup_time / WARMUP_SECONDS).clamp(0.0, 1.0),
             smoothed: reading.to_vec(),
             typology: None,
             regime_switch: false,
@@ -877,21 +966,23 @@ impl FailSafeSystem {
 
     /// Detect sensor failures BEFORE they cause missed anomalies.
     ///
-    /// A channel must be pinned at exactly zero for STUCK_ZERO_MIN_SAMPLES
-    /// consecutive readings before it is declared dead — a single transient 0.0
+    /// A channel must be pinned at exactly zero for STUCK_ZERO_SECONDS of real
+    /// time before it is declared dead — a single transient 0.0
     /// (ADC glitch, one unplugged moment) must not permanently drop the channel
     /// out of the health set and lower the whole system's alert threshold. The
     /// channel auto-recovers (health restored to 1.0) the instant it reads a
-    /// real value again.
-    fn detect_sensor_failures(&mut self, reading: &[f64]) -> Vec<SensorFailure> {
+    /// real value again. Accumulating wall-clock (via `dt_s`) rather than a
+    /// sample count keeps the dead-time identical on a 2 Hz rig (~10 zero
+    /// readings) and a 25 Hz logger (~125 readings).
+    fn detect_sensor_failures(&mut self, reading: &[f64], dt_s: f64) -> Vec<SensorFailure> {
         let mut failures = Vec::new();
         for (ch, &value) in reading.iter().enumerate() {
             let Some(streak) = self.zero_streaks.get_mut(ch) else {
                 continue;
             };
             if value.abs() < 1e-10 {
-                *streak += 1;
-                if *streak >= STUCK_ZERO_MIN_SAMPLES {
+                *streak += dt_s;
+                if *streak >= STUCK_ZERO_SECONDS {
                     // Flag only on the transition into the dead state, so a
                     // flatlined channel doesn't re-report every single sample.
                     let was_healthy = self.sensor_health[ch] > 0.5;
@@ -908,7 +999,7 @@ impl FailSafeSystem {
             } else {
                 // Recovered: any valid reading clears the streak and restores
                 // full health for this channel.
-                *streak = 0;
+                *streak = 0.0;
                 self.sensor_health[ch] = 1.0;
             }
         }
@@ -950,6 +1041,10 @@ pub struct FailSafeResult {
     pub alert_level: u8,
     pub alert_name: String,
     pub consecutive_anomalies: usize,
+    /// Wall-clock seconds the stream has been continuously anomalous (drives
+    /// escalation; `alert_level` is derived from this, not the sample counter).
+    #[serde(default)]
+    pub anomalous_seconds: f64,
     pub sensor_failures: Vec<SensorFailure>,
     pub degraded_sensors: Vec<usize>,
     /// True while the detector is still establishing a baseline after connect —
@@ -1297,15 +1392,17 @@ mod tests {
         // report an anomaly during the warm-up window (the old behaviour fired
         // on essentially every reading because baseline_mean was all zeros).
         let mut system = FailSafeSystem::new(3);
+        let reference_dt = system.sample_period_s();
+        let warmup_readings = (WARMUP_SECONDS / reference_dt).ceil() as usize;
 
-        // First WARMUP_SAMPLES-1 readings: reported as warming up, never anomaly.
-        for _ in 0..(WARMUP_SAMPLES - 1) {
+        // All but the final warm-up reading: reported as warming up, never anomaly.
+        for _ in 0..(warmup_readings.saturating_sub(1).max(1)) {
             let r = system.detect(&[42.0, 43.0, 44.0]).unwrap();
             assert!(!r.is_anomaly, "must not alarm during warm-up");
             assert!(r.warming_up, "expected warming-up phase");
         }
 
-        // The final warm-up sample flips it to ready and calibrates the baseline.
+        // The final warm-up reading flips it to ready and calibrates the baseline.
         let r = system.detect(&[42.0, 43.0, 44.0]).unwrap();
         assert!(!r.warming_up, "baseline should be established now");
         assert!(system.baseline_ready);

@@ -55,10 +55,17 @@ fn framework_matches_python_ground_truth() {
             || k.ends_with("_decay_tau1")
             || k.ends_with("_decay_tau2")
     };
+    // The reference ground truth computed AUC as a unit-spaced integral (the
+    // cadence-implicit bug). The port now returns a true time integral; at
+    // sr=10 the seconds-based AUC is exactly the unit-spaced value / 10.
+    let is_auc_key = |k: &str| k.ends_with("_da_auc") || k == "global_total_auc";
 
     for (i, k) in keys.iter().enumerate() {
-        let a = got[i];
-        let b = gt[i];
+        let mut a = got[i];
+        let mut b = gt[i];
+        if is_auc_key(k) {
+            b /= 10.0; // convert the unit-spaced Python ground truth to seconds
+        }
         let scale = b.abs().max(1.0);
         let diff = (a - b).abs() / scale;
         if is_decay_param(k) {

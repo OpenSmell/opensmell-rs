@@ -1,18 +1,20 @@
 use crate::{Baseline, Result};
 
-pub fn extract(normalized: &[f64], raw: &[f64], baseline: &Baseline) -> Result<Vec<f64>> {
+pub fn extract(normalized: &[f64], raw: &[f64], baseline: &Baseline, sr: f64) -> Result<Vec<f64>> {
+    let fs = if sr.is_finite() { sr.abs() } else { 1e-9 }.max(1e-9);
     let mut features = Vec::new();
     for ch in 0..normalized.len() {
         // Response latency: first index where signal exceeds 3x baseline noise
         let threshold = 3.0 * baseline.std[ch];
         let latency = raw.iter().position(|&v| (v - baseline.r0[ch]).abs() > threshold)
-            .unwrap_or(raw.len()) as f64;
+            .unwrap_or(raw.len()) as f64 / fs;
         features.push(latency);
     }
     Ok(features)
 }
 
-pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f64>> {
+pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline, sr: f64) -> Result<Vec<f64>> {
+    let fs = if sr.is_finite() { sr.abs() } else { 1e-9 }.max(1e-9);
     let n_channels = window[0].len();
     let mut features = Vec::new();
 
@@ -40,10 +42,10 @@ pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f6
         let variance = centered.iter().map(|v| v.powi(2)).sum::<f64>() / centered.len() as f64;
         features.push(variance.sqrt());
 
-        // Response latency: time to first exceed 3x noise
+        // Response latency: time to first exceed 3x noise (sample count / fs)
         let threshold = 3.0 * baseline.std[ch];
         let latency = raw_vals.iter().position(|&v| (v - baseline.r0[ch]).abs() > threshold)
-            .unwrap_or(raw_vals.len()) as f64;
+            .unwrap_or(raw_vals.len()) as f64 / fs;
         features.push(latency);
     }
     Ok(features)

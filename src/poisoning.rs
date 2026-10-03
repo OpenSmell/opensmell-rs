@@ -94,6 +94,12 @@ pub struct PoisoningDetector {
     history: Vec<Vec<SensorMetrics>>,
     /// Per-channel baseline metrics (initial calibration).
     baselines: Vec<Option<SensorMetrics>>,
+    /// Sampling rate (Hz) of the data windows fed to
+    /// [`initialize_channel`](Self::initialize_channel) /
+    /// [`update_channel`](Self::update_channel). Recovery time and drift rate
+    /// are computed on a real time axis (samples / sampling_rate) rather than a
+    /// hard-coded 10 Hz assumption.
+    sampling_rate: f64,
 }
 
 impl PoisoningDetector {
@@ -102,7 +108,15 @@ impl PoisoningDetector {
             config,
             history: vec![Vec::new(); n_channels],
             baselines: vec![None; n_channels],
+            sampling_rate: 10.0,
         }
+    }
+
+    /// Set the ingestion cadence (Hz) of the data windows; recovery time and
+    /// drift rate are then honest seconds regardless of cadence.
+    pub fn with_sampling_rate(mut self, sr: f64) -> Self {
+        self.sampling_rate = if sr.is_finite() && sr > 0.0 { sr } else { 10.0 };
+        self
     }
 
     /// Initialize sensor tracking with baseline measurements.
@@ -114,7 +128,7 @@ impl PoisoningDetector {
             });
         }
 
-        let metrics = compute_metrics(data, 10.0);
+        let metrics = compute_metrics(data, self.sampling_rate);
         self.baselines[channel] = Some(metrics.clone());
         self.history[channel].push(metrics.clone());
         Ok(metrics)
@@ -144,7 +158,7 @@ impl PoisoningDetector {
             });
         }
 
-        let metrics = compute_metrics(data, 10.0);
+        let metrics = compute_metrics(data, self.sampling_rate);
         self.history[channel].push(metrics.clone());
 
         // Keep only recent history (last 7 days)

@@ -57,9 +57,14 @@ impl AmbientModel {
     }
 }
 
-/// Stream cadence of the engine (10 Hz). Used to convert per-second desorption
-/// time constants into per-sample decay factors.
-const SAMPLE_PERIOD_S: f64 = 0.1;
+/// Reference stream cadence of the engine (10 Hz). Physical rate constants
+/// (`q_state`, `q_param`, desorption `τ`) are quoted *per second* and folded to
+/// the actual reading cadence `dt` at detect time (`Q_step = Q_ref·dt/period`,
+/// decay `exp(−dt/τ)`), so a field logger sampling at 6 Hz, 1 Hz or once a
+/// minute sees the same physical process model it would at 10 Hz.
+/// `EngineConfig::sample_period_s` is the cadence `detect` assumes when the
+/// caller does not supply a real `dt`.
+pub const SAMPLE_PERIOD_S: f64 = 0.1;
 
 /// Per-channel adsorption-memory configuration.
 ///
@@ -71,13 +76,21 @@ const SAMPLE_PERIOD_S: f64 = 0.1;
 /// a desorption tail is predicted and absorbed rather than read as drift or as
 /// a fresh event. Measurement becomes `y_i = g_i·(x_i + m_i) + o_i`; nothing
 /// else in the engine changes.
+///
+/// With `two_exp` the residue is bi-exponential —
+/// `m(t) = a1·e^(−t/τ1) + (1−a1)·e^(−t/τ2)`, the field-observed post-exposure
+/// shape (a fast wash-out followed by a slow plateau) — tracked as *two* memory
+/// states per channel (`[x, m1, m2]`). Process noise on each component is
+/// split by `a1` so the fast component carries most of the residue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdsorptionConfig {
     /// Master switch. Disabled keeps the legacy c-dimensional `[x]` state
     /// layout exactly (no behavioural change to existing deployments).
+    #[serde(default)]
     pub enabled: bool,
     /// Per-channel desorption time constants in seconds. Shorter ⇒ residue
     /// clears faster; a missing entry falls back to `tau_default_s`.
+    #[serde(default)]
     pub tau_s: Vec<f64>,
     /// Fallback time constant (seconds) for channels without a `tau_s` entry.
     /// A calibration/purge experiment should replace this per sensor.
@@ -85,11 +98,52 @@ pub struct AdsorptionConfig {
     pub tau_default_s: f64,
     /// Process noise on the memory state (how freely `m` may move). Kept
     /// ≪ `q_state` so genuine events stay in `x` and only residue sticks to `m`.
+    #[serde(default = "default_q_adsorption")]
     pub q_adsorption: f64,
+    /// Bi-exponential residue: a second memory state per channel decaying with
+    /// `tau2_s`; the two components' process noise is split by `a1`. Disabled
+    /// keeps exactly the single-`m` legacy layout.
+    #[serde(default)]
+    pub two_exp: bool,
+    /// Per-channel secondary (slow) time constant, seconds. Missing entries
+    /// fall back to `tau2_default_s`.
+    #[serde(default)]
+    pub tau2_s: Vec<f64>,
+    /// Fallback secondary time constant (seconds).
+    #[serde(default = "default_tau2_s")]
+    pub tau2_default_s: f64,
+    /// Per-channel weight (0..1) of the fast component; the slow component
+    /// takes the remainder.
+    #[serde(default)]
+    pub a1: Vec<f64>,
+    /// Fallback fast-component weight for channels without an `a1` entry.
+    #[serde(default = "default_a1")]
+    pub a1_default: f64,
 }
 
 fn default_tau_s() -> f64 {
     300.0
+}
+
+/// serde default for `EngineConfig::sample_period_s` (the reference 10 Hz).
+fn default_sample_period_s() -> f64 {
+    SAMPLE_PERIOD_S
+}
+
+fn default_tau2_s() -> f64 {
+    15.0
+}
+
+fn default_a1() -> f64 {
+    0.6
+}
+
+fn default_q_adsorption() -> f64 {
+    1e-5
+}
+
+fn default_min_channels() -> usize {
+    1
 }
 
 impl Default for AdsorptionConfig {
@@ -98,15 +152,40 @@ impl Default for AdsorptionConfig {
             enabled: false,
             tau_s: Vec::new(),
             tau_default_s: default_tau_s(),
-            q_adsorption: 1e-5,
+            q_adsorption: default_q_adsorption(),
+            two_exp: false,
+            tau2_s: Vec::new(),
+            tau2_default_s: default_tau2_s(),
+            a1: Vec::new(),
+            a1_default: default_a1(),
         }
     }
 }
 
-/// Per-sample decay factor of the memory state for one channel.
-fn desorption_decay(cfg: &AdsorptionConfig, i: usize) -> f64 {
+/// Per-component memory decay factors for one channel over one `dt` interval.
+/// Single-exponential mode reports the same factor twice (the second memory
+/// state does not exist there; callers index it only when `two_exp`).
+fn component_decays(cfg: &AdsorptionConfig, i: usize, dt_s: f64) -> [f64; 2] {
     let tau = cfg.tau_s.get(i).copied().unwrap_or(cfg.tau_default_s).max(0.1);
-    (-SAMPLE_PERIOD_S / tau).exp()
+    let d1 = (-dt_s / tau).exp();
+    if cfg.two_exp {
+        let tau2 = cfg.tau2_s.get(i).copied().unwrap_or(cfg.tau2_default_s).max(0.1);
+        [d1, (-dt_s / tau2).exp()]
+    } else {
+        [d1, d1]
+    }
+}
+
+/// Per-channel process-noise split for the bi-exponential components. In
+/// single-exponential mode the weight collapses to the full `q_adsorption` on
+/// the single memory state.
+fn mem_process_noise(cfg: &AdsorptionConfig, i: usize) -> [f64; 2] {
+    if cfg.two_exp {
+        let a = cfg.a1.get(i).copied().unwrap_or(cfg.a1_default).clamp(0.0, 1.0);
+        [cfg.q_adsorption * a, cfg.q_adsorption * (1.0 - a)]
+    } else {
+        [cfg.q_adsorption, 0.0]
+    }
 }
 
 /// Per-channel exponent from the response config (missing entries → default).
@@ -222,6 +301,12 @@ impl Default for ResponseConfig {
 pub struct EngineConfig {
     pub state_filter: StateFilterKind,
     pub ukf: UkfParams,
+    /// Reference cadence that `detect` assumes when no real `dt` is supplied,
+    /// and the cadence the per-second physics constants are normalized to.
+    /// Process noise is scaled by `dt/period` and desorption decays by
+    /// `exp(−dt/τ)` when the caller drives `detect_with_dt` at a different rate.
+    #[serde(default = "default_sample_period_s")]
+    pub sample_period_s: f64,
     /// State process noise (per channel). Small ⇒ smooth baseline.
     pub q_state: f64,
     /// Parameter walk noise (offset, per channel). ≪ q_state ⇒ slow drift.
@@ -235,6 +320,38 @@ pub struct EngineConfig {
     pub k_std: [f64; 3],
     /// Minimum per-channel z before any multivariate claim counts.
     pub z_min: f64,
+    /// Minimum number of channels that must simultaneously clear the
+    /// sensitivity-scaled budget threshold before an anomaly is trusted.
+    /// 1 preserves the legacy single-channel `max_z` verdict; 2+ demands
+    /// multi-sensor corroboration (rejects isolated single-sensor
+    /// transients that a field corpus shows dominate clean-period FPs).
+    #[serde(default = "default_min_channels")]
+    pub min_channels: usize,
+    /// Level-anchored threshold in calibrated σ (scaled by 1/sensitivity): a
+    /// slow plume that the Kalman absorbs (small per-sample innovations) still
+    /// moves the filter's level away from its calibrated baseline by many σ.
+    /// `0` disables the level leg.
+    #[serde(default)]
+    pub level_budget: f64,
+    /// Seconds of level history the level leg must be *growing* against: when
+    /// > 0, the level-anchored vote only fires if the max level deviation is
+    /// strictly larger now than `level_rise_lookback_s` ago. The TADI corpus
+    /// discriminator: an active plume *rises* (deviation grows), while a
+    /// post-exposure recovery plateau is already clean by reference yet the
+    /// array is still elevated and *settling* (deviation falls). `0` disables
+    /// the rise constraint (fires on any sufficient level).
+    #[serde(default)]
+    pub level_rise_lookback_s: f64,
+    /// Seconds of rolling level reference for the level leg: when > 0, the
+    /// deviation is measured against the sensor's own filtered level
+    /// `level_ref_s` ago (a rolling baseline), instead of the fixed calibration
+    /// anchor. The TADI finding: multi-day files drift far from the day-1
+    /// anchor (temperature/humidity/aging), so a *stale* anchor turns slow
+    /// weather drift into clean-period level FPs. A minutes-scale reference
+    /// absorbs drift/weather over hours-days while leaving a minutes-scale
+    /// plume visible. `0` keeps the calibration anchor.
+    #[serde(default)]
+    pub level_ref_s: f64,
     /// User-facing sensitivity knob (same semantics as the legacy detector).
     pub sensitivity: f64,
     pub regimes: RegimeConfig,
@@ -253,12 +370,17 @@ impl Default for EngineConfig {
         Self {
             state_filter: StateFilterKind::Unscented,
             ukf: UkfParams::default(),
+            sample_period_s: SAMPLE_PERIOD_S,
             q_state: 1e-3,
             q_param: 1e-6,
             r_scale: 1.0,
             innovation_ridge: 1e-9,
             k_std: [5.0, 6.0, 4.0],
             z_min: 0.5,
+            min_channels: 1,
+            level_budget: 0.0,
+            level_rise_lookback_s: 0.0,
+            level_ref_s: 0.0,
             sensitivity: 1.0,
             regimes: RegimeConfig::default(),
             typology: TypologyConfig::default(),
@@ -334,7 +456,12 @@ pub struct DualKalmanEngine {
     platt: PlattCalibrator,
     stimulus: StimulusGainTracker,
     n_samples: usize,
-    warmup_samples: usize,
+    warmup_time: f64,
+    /// Cumulative elapsed seconds fed to `detect_with_dt` (drives the
+    /// stimulus schedule in real time instead of at a hard-coded sample count).
+    time_s: f64,
+    /// Next automatic-reference time boundary (seconds since engine start).
+    next_event_at: f64,
     /// Raw readings buffered before auto-calibration during the warm-up window.
     baseline_buffer: Vec<Vec<f64>>,
     last_innovation: Vec<f64>,
@@ -346,9 +473,25 @@ pub struct DualKalmanEngine {
     recent_health: Vec<HealthFinding>,
     poisoned_channels: Vec<usize>,
     calibrated: bool,
+    /// Calibrated baseline mean per channel (the "no-leak-yet" reference level).
+    /// A level-anchored verdict compares the filter's smoothed level to this in
+    /// calibrated σ — catching slow plumes whose per-sample innovations never
+    /// cross the innovation budgets (the Kalman absorbs a slow ramp).
+    level_anchor: Vec<f64>,
+    /// (time_s, per-channel filtered level) history for the level leg. When a
+    /// rolling reference (`level_ref_s > 0`) is configured the deviation is
+    /// measured against the level N seconds ago (absorbs hours-days drift /
+    /// weather, keeps a minutes-scale plume visible); it also drives the
+    /// rise-constrained firing.
+    level_history: std::collections::VecDeque<(f64, Vec<f64>)>,
 }
 
-const WARMUP_SAMPLES: usize = 60;
+const WARMUP_SECONDS: f64 = 6.0;
+
+/// Maximum `dt` (seconds) tolerated before a reading is treated as a data gap;
+/// rate constants saturate above this so a missed chunk does not inject an
+/// unbounded process-noise spike.
+const MAX_GAP_S: f64 = 60.0;
 
 impl DualKalmanEngine {
     pub fn new(n_channels: usize) -> Self {
@@ -384,9 +527,11 @@ impl DualKalmanEngine {
                 vec![1.0; n_channels],
                 config.stimulus.clone(),
             ),
+            next_event_at: config.stimulus.period_s as f64,
             config,
             n_samples: 0,
-            warmup_samples: 0,
+            warmup_time: 0.0,
+            time_s: 0.0,
             baseline_buffer: Vec::new(),
             last_innovation: vec![0.0; n_channels],
             last_inno_cov: vec![vec![0.0; n_channels]; n_channels],
@@ -397,11 +542,14 @@ impl DualKalmanEngine {
             recent_health: Vec::new(),
             poisoned_channels: Vec::new(),
             calibrated: false,
+            level_anchor: vec![0.0; n_channels],
+            level_history: std::collections::VecDeque::new(),
         }
     }
 
     pub fn set_config(&mut self, config: EngineConfig) {
-        let state_dim_changed = config.adsorption.enabled != self.config.adsorption.enabled;
+        let state_dim_changed = config.adsorption.enabled != self.config.adsorption.enabled
+            || config.adsorption.two_exp != self.config.adsorption.two_exp;
         let param_dim_changed =
             config.response.power_law_enabled != self.config.response.power_law_enabled;
         self.config = config.clone();
@@ -410,6 +558,10 @@ impl DualKalmanEngine {
             self.g.clone(),
             config.stimulus.clone(),
         );
+        // Re-anchor the automatic-reference schedule from the current time so a
+        // caller changing `stimulus.period_s` after construction gets the new
+        // cadence (next reference `period_s` after now).
+        self.next_event_at = self.time_s + self.config.stimulus.period_s as f64;
         if state_dim_changed {
             // The state layout changes with the master switch; resize the
             // filter so a config applied before calibration stays consistent.
@@ -434,6 +586,16 @@ impl DualKalmanEngine {
     /// Dimension of the state filter given the current adsorption switch.
     fn filter_dim(&self) -> usize {
         if self.config.adsorption.enabled {
+            self.n_channels + self.mem_dim()
+        } else {
+            self.n_channels
+        }
+    }
+
+    /// Number of memory states per channel: 1 (legacy single-`m`) or 2 when
+    /// the bi-exponential residue is enabled.
+    fn mem_dim(&self) -> usize {
+        if self.config.adsorption.two_exp {
             2 * self.n_channels
         } else {
             self.n_channels
@@ -481,7 +643,28 @@ impl DualKalmanEngine {
     }
 
     /// Current adsorption-memory block `m` (empty when the state is disabled).
+    /// In bi-exponential mode the per-channel value is the summed residue
+    /// `m1 + m2` (the observable the singles-exp mode always reported).
     pub fn adsorption_memory(&self) -> Vec<f64> {
+        if self.config.adsorption.enabled {
+            let c = self.n_channels;
+            if self.config.adsorption.two_exp {
+                (0..c)
+                    .map(|i| {
+                        self.state_filter.x[c + 2 * i] + self.state_filter.x[c + 2 * i + 1]
+                    })
+                    .collect()
+            } else {
+                self.state_filter.x[c..].to_vec()
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Raw per-channel memory components (length `mem_dim`): the single `m` or
+    /// `[m1, m2]` per channel when bi-exponential. Empty when disabled.
+    pub fn adsorption_components(&self) -> Vec<f64> {
         if self.config.adsorption.enabled {
             self.state_filter.x[self.n_channels..].to_vec()
         } else {
@@ -522,6 +705,7 @@ impl DualKalmanEngine {
         for m in mean.iter_mut() {
             *m /= n as f64;
         }
+        self.level_anchor = mean.clone();
         let mut var = vec![1e-6; c];
         for s in samples {
             for (i, &v) in s.iter().enumerate() {
@@ -544,17 +728,30 @@ impl DualKalmanEngine {
 
         // State prior: mean with a process-noise floor. With the adsorption
         // state enabled the memory block starts at zero with the same scale
-        // (a freshly calibrated sensor holds no residue).
+        // (a freshly calibrated sensor holds no residue). Bi-exponential mode
+        // splits the prior by `a1` so the fast component is initially more
+        // free to absorb residue, matching the fitted weight.
         let d = self.filter_dim();
         let p_x = var.iter().map(|&v| v.max(1e-4) * 4.0).collect::<Vec<f64>>();
         let mut prior = mean.clone();
         let mut prior_p = diag(&p_x);
         if self.config.adsorption.enabled {
-            prior.extend(std::iter::repeat_n(0.0, self.n_channels));
+            let ads = &self.config.adsorption;
+            let mem = self.mem_dim();
+            prior.extend(std::iter::repeat_n(0.0, mem));
             let mut full = vec![vec![0.0; d]; d];
-            for i in 0..self.n_channels {
-                full[i][i] = p_x[i];
-                full[self.n_channels + i][self.n_channels + i] = p_x[i];
+            if ads.two_exp {
+                for i in 0..self.n_channels {
+                    let a = ads.a1.get(i).copied().unwrap_or(ads.a1_default).clamp(0.0, 1.0);
+                    full[i][i] = p_x[i];
+                    full[c + 2 * i][c + 2 * i] = p_x[i] * a;
+                    full[c + 2 * i + 1][c + 2 * i + 1] = p_x[i] * (1.0 - a);
+                }
+            } else {
+                for i in 0..self.n_channels {
+                    full[i][i] = p_x[i];
+                    full[self.n_channels + i][self.n_channels + i] = p_x[i];
+                }
             }
             prior_p = full;
         }
@@ -588,16 +785,34 @@ impl DualKalmanEngine {
         self.calibrated
     }
 
-    /// Run one 10 Hz reading through both filters. `ambient` carries on-board
-    /// temperature/humidity when present (None ⇒ ambient correction is zero).
+    /// Run one reading through both filters at the configured reference cadence.
+    /// `ambient` carries on-board temperature/humidity when present (None ⇒ the
+    /// ambient correction is zero).
     pub fn detect(&mut self, reading: &[f64], ambient: Option<AmbientReading>) -> Result<EngineVerdict> {
-        let result = self.detect_raw(reading, ambient)?;
-        Ok(result)
+        self.detect_with_dt(reading, ambient, self.config.sample_period_s.max(1e-4))
     }
 
     /// Convenience: detect with no ambient data (used by warm-up/tests).
     pub fn detect_no_ambient(&mut self, reading: &[f64]) -> Result<EngineVerdict> {
-        self.detect(reading, None)
+        self.detect_with_dt(reading, None, self.config.sample_period_s.max(1e-4))
+    }
+
+    /// Run one reading with its *actual* inter-sample gap `dt_s`. The physics
+    /// knobs are per-second: process noise scales as `dt/period`, desorption
+    /// decays by `exp(−dt/τ)`, and the warm-up / stimulus schedule advances in
+    /// real time. A field logger sampling at any cadence therefore sees the
+    /// same physical process model it would at the reference 10 Hz.
+    pub fn detect_with_dt(
+        &mut self,
+        reading: &[f64],
+        ambient: Option<AmbientReading>,
+        dt_s: f64,
+    ) -> Result<EngineVerdict> {
+        // Saturate pathological gaps (cross-day file splits, logger naps) so a
+        // lost chunk does not blow the process-noise covariance apart; the
+        // caller still sees the verdict for the reading that did arrive.
+        let dt = dt_s.max(1e-4).min(MAX_GAP_S);
+        self.detect_raw(reading, ambient, dt)
     }
 
     /// Verdict for a warm-up sample: explicitly non-anomalous, tagged `warming_up`
@@ -632,7 +847,7 @@ impl DualKalmanEngine {
         1.0 / (1.0 + (-(n as f64 - 30.0) / 15.0).exp())
     }
 
-    fn detect_raw(&mut self, reading: &[f64], ambient: Option<AmbientReading>) -> Result<EngineVerdict> {
+    fn detect_raw(&mut self, reading: &[f64], ambient: Option<AmbientReading>, dt: f64) -> Result<EngineVerdict> {
         if reading.len() != self.n_channels {
             return Err(OpenSmellError::InvalidChannelCount {
                 got: reading.len(),
@@ -640,21 +855,24 @@ impl DualKalmanEngine {
             });
         }
         self.n_samples += 1;
+        self.time_s += dt;
 
         // Fresh-device warm-up: an uncalibrated engine buffers the first
-        // `WARMUP_SAMPLES` readings, reports `warming_up`, and never alarms —
+        // `WARMUP_SECONDS` of readings, reports `warming_up`, and never alarms —
         // the debut of a brand-new board stays quiet (design §6, §11.1). When
         // the buffer fills, it auto-calibrates exactly like the legacy
         // detector, so a caller that only feeds `detect` gets a baseline too.
+        // In seconds so a slow-logged board (e.g. the 6 s TADI loggers) holds a
+        // comparable calibration span. 6 s ≈ 60 samples at the reference 10 Hz.
         if !self.calibrated {
             self.baseline_buffer.push(reading.to_vec());
-            self.warmup_samples += 1;
-            if self.warmup_samples >= WARMUP_SAMPLES {
+            self.warmup_time += dt;
+            if self.warmup_time + 1e-9 >= WARMUP_SECONDS {
                 let samples = std::mem::take(&mut self.baseline_buffer);
                 self.calibrate_baseline(&samples)?;
-                self.warmup_samples = 0;
+                self.warmup_time = 0.0;
                 // Fall through: this reading now runs the real path on the
-                // just-established baseline (it is exactly the 60th reading).
+                // just-established baseline.
             } else {
                 return Ok(self.warm_up_verdict(reading));
             }
@@ -677,24 +895,43 @@ impl DualKalmanEngine {
             .collect();
 
         // 2. State filter: predict. Environmental level `x` is a random walk
-        // (F=I, Q = q_state·I); with adsorption enabled the memory block `m`
-        // decays by exp(−Δt/τ_i) toward zero (Q = q_adsorption·I).
+        // (F=I, Q = q_state·dr·I where dr = dt/period — the per-second walk
+        // rate stays physical at any cadence); with adsorption enabled the
+        // memory blocks decay by exp(−dt/τ_i) toward zero (Q split by the
+        // bi-exponential weights when `two_exp`).
         let c = self.n_channels;
         let ads_on = self.config.adsorption.enabled;
+        let two_exp = self.config.adsorption.two_exp;
+        let dr = dt / self.config.sample_period_s.max(1e-6);
+        let ads_cfg = &self.config.adsorption;
         if ads_on {
-            let d = 2 * c;
+            let d = self.filter_dim();
             let mut f = vec![vec![0.0; d]; d];
             let mut q = vec![vec![0.0; d]; d];
-            for i in 0..c {
-                f[i][i] = 1.0;
-                f[c + i][c + i] = desorption_decay(&self.config.adsorption, i);
-                q[i][i] = self.config.q_state;
-                q[c + i][c + i] = self.config.adsorption.q_adsorption;
+            if ads_cfg.two_exp {
+                for i in 0..c {
+                    let [p1, p2] = component_decays(ads_cfg, i, dt);
+                    let [q1, q2] = mem_process_noise(ads_cfg, i);
+                    f[i][i] = 1.0;
+                    f[c + 2 * i][c + 2 * i] = p1;
+                    f[c + 2 * i + 1][c + 2 * i + 1] = p2;
+                    q[i][i] = self.config.q_state * dr;
+                    q[c + 2 * i][c + 2 * i] = q1 * dr;
+                    q[c + 2 * i + 1][c + 2 * i + 1] = q2 * dr;
+                }
+            } else {
+                for i in 0..c {
+                    let [p1, _] = component_decays(ads_cfg, i, dt);
+                    f[i][i] = 1.0;
+                    f[c + i][c + i] = p1;
+                    q[i][i] = self.config.q_state * dr;
+                    q[c + i][c + i] = ads_cfg.q_adsorption * dr;
+                }
             }
             self.state_filter.predict(&f, &q)?;
         } else {
-            let qx = diag(&vec![self.config.q_state; self.n_channels]);
-            self.state_filter.predict(&identity(self.n_channels), &qx)?;
+            let qx = diag(&vec![self.config.q_state * dr; c]);
+            self.state_filter.predict(&identity(c), &qx)?;
         }
 
         // Measurement model.  The *linear* base is y_i = g_i·x_i + o_i;
@@ -720,7 +957,12 @@ impl DualKalmanEngine {
                     };
                     h_lin[i][i] = g[i] * dlevel;
                     if ads_on {
-                        h_lin[i][self.n_channels + i] = g[i];
+                        if two_exp {
+                            h_lin[i][c + 2 * i] = g[i];
+                            h_lin[i][c + 2 * i + 1] = g[i];
+                        } else {
+                            h_lin[i][c + i] = g[i];
+                        }
                     }
                 }
                 self.state_filter.update_linear(&corrected, &h_lin, &r_mat, self.config.innovation_ridge)?
@@ -729,11 +971,20 @@ impl DualKalmanEngine {
                 let h = |xp: &[f64]| -> Vec<f64> {
                     (0..c)
                         .map(|i| {
+                            let mem = if ads_on {
+                                if two_exp {
+                                    xp[c + 2 * i] + xp[c + 2 * i + 1]
+                                } else {
+                                    xp[c + i]
+                                }
+                            } else {
+                                0.0
+                            };
                             let level = if pl_on {
                                 phi(xp[i], alpha[i])
                             } else {
                                 xp[i]
-                            } + if ads_on { xp[c + i] } else { 0.0 };
+                            } + mem;
                             g[i] * level + o[i]
                         })
                         .collect()
@@ -769,14 +1020,18 @@ impl DualKalmanEngine {
         let mut h_theta = vec![vec![0.0; pd]; self.n_channels];
         for i in 0..self.n_channels {
             let base = pw * i;
-            let level = if ads_on {
-                x_hat[i] + x_hat[self.n_channels + i]
+            let mem = if ads_on {
+                if two_exp {
+                    x_hat[c + 2 * i] + x_hat[c + 2 * i + 1]
+                } else {
+                    x_hat[c + i]
+                }
             } else {
-                x_hat[i]
+                0.0
             };
+            let level = x_hat[i] + mem;
             if pl_on {
-                h_theta[i][base] = phi(x_hat[i], alpha[i])
-                    + if ads_on { x_hat[self.n_channels + i] } else { 0.0 };
+                h_theta[i][base] = phi(x_hat[i], alpha[i]) + mem;
                 h_theta[i][base + 1] = 1.0;
                 h_theta[i][base + 2] = self.g[i] * dphi_da(x_hat[i], alpha[i]);
             } else {
@@ -786,10 +1041,10 @@ impl DualKalmanEngine {
         }
         let mut q_vec = Vec::with_capacity(pd);
         for _ in 0..self.n_channels {
-            q_vec.push(self.config.q_param);
-            q_vec.push(self.config.q_param);
+            q_vec.push(self.config.q_param * dr);
+            q_vec.push(self.config.q_param * dr);
             if pl_on {
-                q_vec.push(self.config.response.q_alpha);
+                q_vec.push(self.config.response.q_alpha * dr);
             }
         }
         let q_theta = diag(&q_vec);
@@ -819,7 +1074,7 @@ impl DualKalmanEngine {
         } else {
             &self.state_filter.x
         };
-        let regime_update = self.regimes.update(reg_x)?;
+        let regime_update = self.regimes.update(reg_x, dt)?;
         let regime_switch = regime_update.switched || regime_update.spawned;
         if regime_switch && !regime_update.anchor_mean.is_empty() {
             let anchor_mean = regime_update.anchor_mean.clone();
@@ -833,7 +1088,7 @@ impl DualKalmanEngine {
                     self.state_filter.p[i][..self.n_channels].copy_from_slice(row);
                 }
                 for i in 0..self.n_channels {
-                    for j in self.n_channels..2 * self.n_channels {
+                    for j in self.n_channels..self.filter_dim() {
                         self.state_filter.p[i][j] = 0.0;
                         self.state_filter.p[j][i] = 0.0;
                     }
@@ -868,8 +1123,104 @@ impl DualKalmanEngine {
                 budget_fired[bi] = true;
             }
         }
+        // Multi-channel corroboration: count how many channels clear the
+        // *sensitive* budget at the current sensitivity. A real gas event
+        // facing an array moves several channels together (same plume), while
+        // an isolated sensor transient moves only one; the TADI corpus shows
+        // the clean-period FPs are single-channel steps. `min_channels` (off by
+        // default) requires that many channels to agree before the anomaly
+        // verdict holds.
+        let sensitive_eff = self.config.k_std[2] / sens;
+        let channels_past = z_scores
+            .iter()
+            .filter(|&&z| z > sensitive_eff)
+            .count();
+        let corroborated = channels_past >= self.config.min_channels.max(1);
         let anomaly_votes = budget_fired.iter().filter(|&&b| b).count();
-        let is_anomaly = anomaly_votes >= 2;
+        let mut is_anomaly = anomaly_votes >= 2 && corroborated;
+
+        // 7b. Level-anchored leg: a slow plume raises the *level* far from its
+        // reference even when per-sample innovations (and so the budget votes)
+        // stay small. Reference is either the calibration anchor (the
+        // "no-leak-yet" baseline) or — when `level_ref_s > 0` — the sensor's
+        // own level N seconds ago, so hours-days drift (weather/aging on a
+        // multi-day file) does not read as a clean-period anomaly. Deliberately
+        // orthogonal to the innovation budgets so it can catch what they
+        // structurally miss, and it uses the *same* corroboration (plume =
+        // several channels move together) to keep isolated sensor transients
+        // quiet.
+        if self.config.level_budget > 0.0 {
+        let level_now: Vec<f64> = self.state_filter.x[..self.n_channels].to_vec();
+        self.level_history.push_back((self.time_s, level_now.clone()));
+        if self.level_history.len() > 1 << 16 {
+            self.level_history.pop_front();
+        }
+        let ref_s = self.config.level_ref_s;
+        let reference: Vec<f64> = if ref_s > 0.0 {
+            let target_t = self.time_s - ref_s;
+            self.level_history
+                .iter()
+                .rev()
+                .find(|&&(ts, _)| ts <= target_t)
+                .map(|&(_, ref lv)| lv.clone())
+                .unwrap_or_else(|| self.level_anchor.clone())
+        } else {
+            self.level_anchor.clone()
+        };
+        let level_anchor_deviations: Vec<f64> = level_now
+            .iter()
+            .zip(reference.iter())
+            .zip(self.underlying_r.iter())
+            .map(|((&lv, &refv), &r)| (lv - refv).abs() / r.max(1e-12).sqrt())
+            .collect();
+        // Rise-constrained firing: an active plume *grows* the deviation; a
+        // recovery plateau is elevated but settling (fails strict growth),
+        // and a rolling reference already absorbs the slow drift that would
+        // otherwise look rising.
+        let mut level_is_rising = true;
+        let rise_s = self.config.level_rise_lookback_s;
+        if rise_s > 0.0 {
+            let lookback_t = self.time_s - rise_s;
+            let past_max = self
+                .level_history
+                .iter()
+                .rev()
+                .find(|&&(ts, _)| ts <= lookback_t)
+                .map(|&(_, ref lv)| {
+                    lv.iter()
+                        .zip(reference.iter())
+                        .zip(self.underlying_r.iter())
+                        .map(|((&clv, &refv), &r)| (clv - refv).abs() / r.max(1e-12).sqrt())
+                        .fold(f64::NEG_INFINITY, f64::max)
+                });
+            level_is_rising = match past_max {
+                Some(past) => {
+                    let cur = level_anchor_deviations.iter().cloned().fold(
+                        f64::NEG_INFINITY,
+                        f64::max,
+                    );
+                    cur > past
+                }
+                None => true, // not enough history yet: allow (cold start)
+            };
+        }
+        let level_eff = self.config.level_budget / sens;
+        let level_channels = level_anchor_deviations
+            .iter()
+            .filter(|&&d| d > level_eff)
+            .count();
+        if level_channels >= self.config.min_channels.max(1) && level_is_rising {
+            // Give the level leg the same two-fold confidence the innovation
+            // legs use: it fires only when corroborated (>= min_channels) *and*
+            // at least one channel clears the conservative innovation budget
+            // too (avoids flagging a mere slow drift alone). Single-channel
+            // transients never pass here (they move level too fast, but only
+            // on one channel → < min_channels).
+            if budget_fired[1] || budget_fired[0] {
+                is_anomaly = true;
+            }
+        }
+        } // end level-anchored leg (level_budget > 0)
 
         // 8. Calibrated confidence (Platt on the raw score).
         let confidence = self.platt.predict(raw_score);
@@ -888,7 +1239,20 @@ impl DualKalmanEngine {
         //     stimulus fires on schedule; per-channel poison confirmation (both
         //     the parameter filter AND the physical gain agree) becomes findings.
         self.recent_health.clear();
-        if self.n_samples.is_multiple_of((self.config.stimulus.period_s * 10).max(1) as usize) {
+        // Automatic reference stimulus fires when real elapsed time crosses the
+        // schedule boundary (was: a hard-coded `period_s·10` sample count, which
+        // drifts by the actual sample cadence). At the reference 10 Hz this is
+        // the same sample as before.
+        let stim_period = self.config.stimulus.period_s as f64;
+        // ε matches the warm-up accumulator convention so accumulated fp error
+        // (10×0.1 = 0.9999999999999999) does not skip a schedule boundary.
+        if stim_period > 0.0 && self.time_s + 1e-9 >= self.next_event_at {
+            loop {
+                self.next_event_at += stim_period;
+                if self.next_event_at > self.time_s + 1e-9 {
+                    break;
+                }
+            }
             let g0 = self.stimulus.g0.clone();
             if let Ok(findings) = self.stimulus.record_stimulus(
                 self.n_samples as u64,
@@ -1004,6 +1368,12 @@ impl DualKalmanEngine {
 
     pub fn confirm_counts(&self) -> (usize, usize) {
         (self.confirmed_anomaly_count, self.confirmed_normal_count)
+    }
+
+    /// Number of automatic reference stimuli recorded so far (schedule health
+    /// hook — the `period_s`-separated schedule fires on real elapsed time).
+    pub fn stimulus_history_len(&self) -> usize {
+        self.stimulus.recent_history().len()
     }
 }
 
@@ -1369,5 +1739,190 @@ mod tests {
             let _ = eng.detect_no_ambient(&[1.0]).unwrap();
         }
         assert!(!eng.detect_no_ambient(&[1.0]).unwrap().is_anomaly);
+    }
+
+    // --- Continuous-time (dt threading) & bi-exponential tests ---
+
+    #[test]
+    fn reference_cadence_detect_and_detect_with_dt_are_identical() {
+        // `detect[_no_ambient]` is exactly `detect_with_dt(dt = sample_period_s)`:
+        // at the reference cadence the physics collapses bit-for-bit onto the
+        // legacy constants (dr = 1, decay exp(−period/τ)).
+        let mut a = DualKalmanEngine::new(2);
+        a.calibrate_baseline(&baseline(2)).unwrap();
+        let mut b = DualKalmanEngine::new(2);
+        b.calibrate_baseline(&baseline(2)).unwrap();
+        for k in 0..40 {
+            let reading = [1.0 + 0.02 * (k as f64).sin(), 2.0];
+            let va = a.detect_no_ambient(&reading).unwrap();
+            let vb = b.detect_with_dt(&reading, None, 0.1).unwrap();
+            assert_eq!(va.is_anomaly, vb.is_anomaly);
+            assert_eq!(va.raw_score.to_bits(), vb.raw_score.to_bits());
+            assert_eq!(va.max_z.to_bits(), vb.max_z.to_bits());
+            assert_eq!(va.n_samples, vb.n_samples);
+            assert_eq!(a.state_filter.x, b.state_filter.x);
+        }
+    }
+
+    #[test]
+    fn coarse_cadence_warmup_lasts_six_seconds() {
+        // A board sampled once a second reaches its 6 s warm-up baseline after 6
+        // readings (the legacy 60-readings rule was 60 samples @10 Hz = 6 s).
+        let mut eng = DualKalmanEngine::new(1);
+        let mut saw_warmup = 0usize;
+        let mut armed_at = 0usize;
+        for k in 0..10 {
+            let v = eng.detect_with_dt(&[1.0], None, 1.0).unwrap();
+            if v.warming_up {
+                saw_warmup += 1;
+            }
+            if eng.is_calibrated() && armed_at == 0 {
+                armed_at = k + 1;
+            }
+        }
+        assert_eq!(saw_warmup, 5, "first five 1 s readings must be warming up");
+        assert_eq!(armed_at, 6, "6th 1 s reading calibrates (6 s ≈ 60 @10 Hz)");
+    }
+
+    #[test]
+    fn adsorption_tracks_true_tail_at_two_cadences() {
+        // τ = 50 s at any cadence: the memory state after a 5 s desorption tail
+        // must sit at exp(−5/50) whether the logger sampled every 0.1 s or 0.5 s.
+        let mk = |dt: f64| {
+            let mut eng = DualKalmanEngine::new(1);
+            let mut cfg = eng.config.clone();
+            cfg.adsorption.enabled = true;
+            cfg.adsorption.tau_s = vec![50.0];
+            cfg.adsorption.q_adsorption = 1e-4;
+            eng.set_config(cfg);
+            eng.calibrate_baseline(&baseline(1)).unwrap();
+            for _ in 0..30 {
+                let _ = eng.detect_with_dt(&[1.0], None, dt).unwrap();
+            }
+            eng.state_filter.x[0] = 1.0;
+            eng.state_filter.x[1] = 0.5;
+            eng
+        };
+        let mut fast = mk(0.1);
+        let mut slow = mk(0.5);
+        for k in 1..=50 {
+            let obs = 1.0 + 0.5 * (-0.1 * k as f64 / 50.0).exp();
+            let v = fast.detect_with_dt(&[obs], None, 0.1).unwrap();
+            assert!(!v.is_anomaly, "tail must not alarm at 0.1 s cadence");
+        }
+        for k in 1..=10 {
+            let obs = 1.0 + 0.5 * (-0.5 * k as f64 / 50.0).exp();
+            let v = slow.detect_with_dt(&[obs], None, 0.5).unwrap();
+            assert!(!v.is_anomaly, "tail must not alarm at 0.5 s cadence");
+        }
+        let m_true = 0.5 * (-5.0_f64 / 50.0).exp();
+        assert!((fast.state_filter.x[1] - m_true).abs() < 0.10, "fast-cadence memory tracks");
+        assert!((slow.state_filter.x[1] - m_true).abs() < 0.10, "slow-cadence memory tracks");
+        assert!(
+            (fast.state_filter.x[1] - slow.state_filter.x[1]).abs() < 0.10,
+            "physical tail state must be ~cadence-independent"
+        );
+    }
+
+    #[test]
+    fn bi_exp_equals_single_exp_when_taus_merge() {
+        // τ2 == τ1 with any a1 collapses the two components to one: the exposed
+        // aggregated memory (m1 + m2) must behave like the legacy single-m state.
+        let run = |two: bool| {
+            let mut eng = DualKalmanEngine::new(1);
+            let mut cfg = eng.config.clone();
+            cfg.adsorption.enabled = true;
+            cfg.adsorption.tau_s = vec![50.0];
+            cfg.adsorption.q_adsorption = 1e-4;
+            if two {
+                cfg.adsorption.two_exp = true;
+                cfg.adsorption.tau2_s = vec![50.0];
+                cfg.adsorption.a1 = vec![0.6];
+            }
+            eng.set_config(cfg);
+            eng.calibrate_baseline(&baseline(1)).unwrap();
+            for _ in 0..30 {
+                let _ = eng.detect_no_ambient(&[1.0]).unwrap();
+            }
+            eng.state_filter.x[0] = 1.0;
+            if two {
+                eng.state_filter.x[1] = 0.5 * 0.6;
+                eng.state_filter.x[2] = 0.5 * (1.0 - 0.6);
+            } else {
+                eng.state_filter.x[1] = 0.5;
+            }
+            eng
+        };
+        let mut single = run(false);
+        let mut bi = run(true);
+        assert_eq!(single.state_filter.x.len(), 2);
+        assert_eq!(bi.state_filter.x.len(), 3, "bi-exponential adds a second memory state");
+        let phi: f64 = (-0.1_f64 / 50.0).exp();
+        for k in 1..=200 {
+            let obs = 1.0 + 0.5 * phi.powi(k);
+            let vs = single.detect_no_ambient(&[obs]).unwrap();
+            let vb = bi.detect_no_ambient(&[obs]).unwrap();
+            assert!(!vs.is_anomaly && !vb.is_anomaly, "merged tail must not alarm");
+        }
+        assert_eq!(bi.adsorption_memory().len(), 1, "aggregated memory stays per-channel");
+        let ms = single.adsorption_memory()[0];
+        let mb = bi.adsorption_memory()[0];
+        assert!(
+            (ms - mb).abs() < 0.05,
+            "merged bi-exp residue (m1+m2={mb}) tracks single-exp ({ms})"
+        );
+        assert_eq!(bi.adsorption_components().len(), 2);
+    }
+
+    #[test]
+    fn bi_exp_exposes_two_components_with_split_noise() {
+        let mut eng = DualKalmanEngine::new(1);
+        let mut cfg = eng.config.clone();
+        cfg.adsorption.enabled = true;
+        cfg.adsorption.two_exp = true;
+        cfg.adsorption.tau_s = vec![20.0];
+        cfg.adsorption.tau2_s = vec![300.0];
+        cfg.adsorption.a1 = vec![0.7];
+        eng.set_config(cfg);
+        eng.calibrate_baseline(&baseline(1)).unwrap();
+        assert_eq!(eng.filter_dim(), 3);
+        assert_eq!(eng.adsorption_components().len(), 2);
+        for _ in 0..30 {
+            let _ = eng.detect_no_ambient(&[1.0]).unwrap();
+        }
+        let v = eng.detect_no_ambient(&[1.0]).unwrap();
+        assert!(!v.is_anomaly);
+        assert_eq!(v.adsorption.len(), 1);
+    }
+
+    #[test]
+    fn stimulus_schedule_fires_on_real_elapsed_time() {
+        let mut eng = DualKalmanEngine::new(1);
+        let mut cfg = eng.config.clone();
+        cfg.stimulus.period_s = 1;
+        eng.set_config(cfg);
+        eng.calibrate_baseline(&baseline(1)).unwrap();
+        for _ in 0..9 {
+            let _ = eng.detect_no_ambient(&[1.0]).unwrap();
+        }
+        assert_eq!(eng.stimulus_history_len(), 0, "no reference before t=1 s");
+        let _ = eng.detect_no_ambient(&[1.0]).unwrap();
+        assert_eq!(eng.stimulus_history_len(), 1, "t=1.0 s crosses the first boundary");
+        for _ in 0..5 {
+            let _ = eng.detect_no_ambient(&[1.0]).unwrap();
+        }
+        assert_eq!(eng.stimulus_history_len(), 1, "t=1.5 s: boundary 2 not reached");
+        for _ in 0..5 {
+            let _ = eng.detect_no_ambient(&[1.0]).unwrap();
+        }
+        assert_eq!(eng.stimulus_history_len(), 2, "t=2.0 s crosses the second boundary");
+        // A 2.5 s gap records one measurement and catches the schedule up to the
+        // boundary strictly after the reading's time (t: 2.0 → 4.5; next 5.0).
+        let _ = eng.detect_with_dt(&[1.0], None, 2.5).unwrap();
+        assert_eq!(eng.stimulus_history_len(), 3, "gap records once, schedule honest");
+        for _ in 0..5 {
+            let _ = eng.detect_no_ambient(&[1.0]).unwrap();
+        }
+        assert_eq!(eng.stimulus_history_len(), 4, "t=5.0 s resumes the per-second cadence");
     }
 }

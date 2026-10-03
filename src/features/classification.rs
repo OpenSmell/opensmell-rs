@@ -16,7 +16,8 @@ pub fn extract(normalized: &[f64], raw: &[f64], baseline: &Baseline) -> Result<V
     Ok(features)
 }
 
-pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f64>> {
+pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline, sr: f64) -> Result<Vec<f64>> {
+    let fs = if sr.is_finite() { sr.abs() } else { 1e-9 }.max(1e-9);
     let n_channels = window[0].len();
     let mut features = Vec::new();
 
@@ -34,8 +35,10 @@ pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f6
         let peak = norm_vals.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
         features.push(peak);
 
-        // Area under curve (AUC) of normalized response
-        let auc: f64 = norm_vals.iter().map(|v| v.abs()).sum::<f64>();
+        // Area under curve (AUC) of normalized response: unit-spaced sum over
+        // time, converted to a true time integral via (1/fs) so the same
+        // physical event yields the same AUC at any sampling cadence.
+        let auc: f64 = norm_vals.iter().map(|v| v.abs()).sum::<f64>() / fs;
         features.push(auc);
 
         // Endpoint delta (last - first)

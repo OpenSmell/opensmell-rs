@@ -20,10 +20,13 @@ pub enum HealthStatus {
 pub struct SensorHealth {
     pub channel: usize,
     pub status: HealthStatus,
+    /// Fractional drift per hour (e.g. 0.01 = 1 %/hour).
     pub drift_rate: f64,
     pub noise_floor: f64,
     pub sensitivity_decay: f64,
     pub hysteresis: f64,
+    /// Estimated hours until the sensor drifts 100% at the measured per-second
+    /// rate (INFINITY when not drifting).
     pub estimated_lifetime_hours: f64,
     pub recommendation: String,
 }
@@ -52,6 +55,9 @@ pub struct HealthMonitor {
     drift_critical: f64,
     noise_warning: f64,
     noise_critical: f64,
+    /// Sampling rate in samples/second used to convert rolling-window sample
+    /// counts into elapsed wall-clock time for drift/lifetime units.
+    sr: f64,
 }
 
 impl HealthMonitor {
@@ -61,11 +67,19 @@ impl HealthMonitor {
             window_size,
             n_channels,
             initial_baseline: None,
-            drift_warning: 0.05,   // 5% drift triggers warning
-            drift_critical: 0.15,  // 15% drift triggers critical
+            drift_warning: 0.05,   // 5%/hr drift triggers warning
+            drift_critical: 0.15,  // 15%/hr drift triggers critical
             noise_warning: 0.1,    // 10% noise increase triggers warning
             noise_critical: 0.3,   // 30% noise increase triggers critical
+            sr: 10.0,
         }
+    }
+
+    /// Set the ingestion sampling rate (Hz) so drift/lifetime come out in
+    /// real per-hour / lifetime time units instead of assumed 10 Hz counts.
+    pub fn with_sr(mut self, sr: f64) -> Self {
+        self.sr = if sr.is_finite() && sr > 0.0 { sr } else { 10.0 };
+        self
     }
 
     /// Set initial baseline for comparison.
@@ -117,13 +131,19 @@ impl HealthMonitor {
             let variance = window.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
             let _std = variance.sqrt();
 
-            // Drift rate: compare first half to second half
+            // Drift rate: fractional change between the first and second half
+            // of the rolling window, normalized to a per-second rate over the
+            // half-window's real duration (half/fs seconds) and reported per
+            // hour. This replaces the old sample-count-based value that was
+            // mislabeled "%/hr" and depended on sampling cadence.
             let half = window.len() / 2;
             let first_mean: f64 = window[..half].iter().sum::<f64>() / half as f64;
             let second_mean: f64 = window[half..].iter().sum::<f64>() / (window.len() - half) as f64;
-            let drift_rate = if first_mean.abs() > 1e-10 {
-                (second_mean - first_mean).abs() / first_mean.abs()
+            let half_seconds = if half > 0 { half as f64 / self.sr } else { 0.0 };
+            let frac_per_sec = if first_mean.abs() > 1e-10 && half_seconds > 0.0 {
+                (second_mean - first_mean).abs() / first_mean.abs() / half_seconds
             } else { 0.0 };
+            let drift_rate = frac_per_sec * 3600.0;
 
             // Noise floor: RMS of first differences
             let noise_floor: f64 = window.windows(2)
@@ -165,10 +185,12 @@ impl HealthMonitor {
                 HealthStatus::Healthy
             };
 
-            // Estimate lifetime based on drift rate
-            let lifetime_hours = if drift_rate > 0.0 {
-                // Linear extrapolation: if drifting at X%/hour, sensor fails at 100%
-                1.0 / drift_rate * 100.0
+            // Estimate lifetime based on drift rate: hours until the sensor has
+            // drifted 100%, linearly extrapolated from the per-second rate
+            // (frac_per_sec * 3600 s/h). This is honest time math, not the old
+            // fabricated "1/rate*100" sample-count value.
+            let lifetime_hours = if frac_per_sec > 0.0 {
+                1.0 / frac_per_sec / 3600.0
             } else {
                 f64::INFINITY
             };

@@ -16,7 +16,8 @@ pub fn extract(normalized: &[f64], _raw: &[f64], baseline: &Baseline) -> Result<
     Ok(features)
 }
 
-pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f64>> {
+pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline, sr: f64) -> Result<Vec<f64>> {
+    let fs = if sr.is_finite() { sr.abs() } else { 1e-9 }.max(1e-9);
     let n_channels = window[0].len();
     let mut features = Vec::new();
 
@@ -40,7 +41,9 @@ pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f6
             features.push(0.0);
         }
 
-        // Drift rate
+        // Drift rate: slope of linear fit to raw values vs the time axis
+        // (sample index / fs). Scaling the per-sample slope by fs converts it
+        // from "per sample" to "per second" — cadence-independent.
         let mean_x = (n - 1.0) / 2.0;
         let mean_y: f64 = raw_vals.iter().sum::<f64>() / n;
         let mut ss_xy = 0.0;
@@ -50,7 +53,7 @@ pub fn extract_window(window: &[Vec<f64>], baseline: &Baseline) -> Result<Vec<f6
             ss_xy += dx * (v - mean_y);
             ss_xx += dx * dx;
         }
-        let drift_rate = if ss_xx > 0.0 { ss_xy / ss_xx } else { 0.0 };
+        let drift_rate = if ss_xx > 0.0 { ss_xy / ss_xx * fs } else { 0.0 };
         features.push(drift_rate);
 
         // Hysteresis: rising vs falling edge magnitude difference

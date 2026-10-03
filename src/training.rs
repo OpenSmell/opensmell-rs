@@ -159,8 +159,13 @@ fn solve_linear(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
 /// Paradigm window features — the reference `compute_window_paradigms` (5 per
 /// channel): `delta_ratio`, `direction`, `mean_slope`, `auc`, `endpoint_delta`.
 ///
+/// `mean_slope` is a per-second slope (`* sr`), and `auc` is a true time
+/// integral (`trapezoid / sr`), matching the reference at any cadence.
+/// `sr <= 0` or non-finite degrades to the dead-channel zeros like the
+/// reference's per-sample default (there the formula is undefined).
+///
 /// Dead/constant channels produce five zeros, matching the reference.
-pub fn paradigm_window_features(window: &[Vec<f64>], r0_samples: usize) -> Vec<f64> {
+pub fn paradigm_window_features(window: &[Vec<f64>], r0_samples: usize, sr: f64) -> Vec<f64> {
     if window.is_empty() {
         return vec![];
     }
@@ -168,6 +173,7 @@ pub fn paradigm_window_features(window: &[Vec<f64>], r0_samples: usize) -> Vec<f
     if n_channels == 0 {
         return vec![];
     }
+    let fs = if sr.is_finite() { sr.abs() } else { 1e-9 }.max(1e-9);
     let r0 = r0_samples.max(1);
     let mut feats = Vec::with_capacity(n_channels * 5);
 
@@ -213,15 +219,16 @@ pub fn paradigm_window_features(window: &[Vec<f64>], r0_samples: usize) -> Vec<f
                 .sum::<f64>()
                 / (ch.len() - 1) as f64
                 / r0_val
+                * fs
         } else {
             0.0
         };
 
         let normalized: Vec<f64> = ch.iter().map(|&v| (v - r0_val).abs() / r0_val).collect();
         let auc = if normalized.len() > 1 {
-            trapezoid(&normalized)
+            trapezoid(&normalized) / fs
         } else {
-            normalized[0]
+            normalized[0] / fs
         };
 
         let n_first = 3.min(ch.len());
@@ -257,8 +264,8 @@ pub fn feature_length_for(n_channels: usize, feature_mode: &str) -> usize {
 }
 
 /// Extract a feature vector from one window according to `feature_mode`.
-/// `sr` (samples/second) is only used by the framework path (time constants,
-/// oscillation frequency). The paradigm path ignores it.
+/// `sr` (samples/second) is used by both the framework and paradigm paths
+/// (time constants / per-second scaling), so features stay cadence-invariant.
 ///
 /// The framework path needs at least ~15 samples to produce sensible values;
 /// very short windows degrade through the internal guards, not here.
@@ -273,7 +280,7 @@ pub fn extract_window_features_by_mode(
         crate::framework::framework_window_features(window, r0_samples, sr)
             .unwrap_or_default()
     } else {
-        paradigm_window_features(window, r0_samples)
+        paradigm_window_features(window, r0_samples, sr)
     }
 }
 
@@ -463,6 +470,11 @@ pub struct ClassifierModel {
     pub feature_mode: String,
     /// Leading samples used to estimate R0 within a window.
     pub r0_samples: usize,
+    /// Sampling rate (Hz) the model was trained with (framework path). Persisted
+    /// so inference re-derives the same seconds-based time features (rise time,
+    /// latency, AUC, drift rate); older models without the field default to 10.
+    #[serde(default = "default_classifier_sr")]
+    pub sr: f64,
     /// StandardScaler fit on the full training set.
     pub scaler_mean: Vec<f64>,
     pub scaler_scale: Vec<f64>,
@@ -474,6 +486,12 @@ pub struct ClassifierModel {
     pub windows_per_class: BTreeMap<String, usize>,
     pub recordings_per_class: BTreeMap<String, usize>,
     pub model_card: ModelCard,
+}
+
+/// Default sampling rate for deserialized models that predate the persisted
+/// `sr` field (the historical SDK assumption of a nominal 10 Hz device).
+fn default_classifier_sr() -> f64 {
+    10.0
 }
 
 /// Lightweight, self-describing export of a trained model intended for
@@ -566,9 +584,9 @@ impl ClassifierModel {
                 n_features: self.n_features,
                 window_size: self.window_size,
                 r0_samples: self.r0_samples,
-                // `sr` is not persisted on the model; the runtime uses the
-                // framework default (10 Hz) when predicting, so report that.
-                sr: 10.0,
+                // The model persists the training cadence so exported features
+                // (and the Python-side reimplementation) match at inference.
+                sr: self.sr,
                 n_windows: self.n_windows,
                 windows_per_class: self.windows_per_class.clone(),
                 recordings_per_class: self.recordings_per_class.clone(),
@@ -619,7 +637,7 @@ impl ClassifierModel {
         if n_channels != self.n_channels() {
             return None;
         }
-        let raw = extract_window_features_by_mode(window, &self.feature_mode, self.r0_samples, 10.0);
+        let raw = extract_window_features_by_mode(window, &self.feature_mode, self.r0_samples, self.sr);
         if raw.len() != self.n_features {
             return None;
         }
@@ -1379,6 +1397,7 @@ pub fn train_classifier(
         n_features,
         feature_mode: opts.feature_mode.clone(),
         r0_samples: DEFAULT_R0_SAMPLES,
+        sr: opts.sr,
         scaler_mean: scaler.mean.clone(),
         scaler_scale: scaler.scale.clone(),
         coef: lr.coef,
@@ -1487,22 +1506,28 @@ mod tests {
     fn test_paradigm_features_matches_hand_computation() {
         // 1 channel, 5 samples. R0 = mean(first 3) = (100+100+101)/3.
         let window = vec![vec![100.0], vec![100.0], vec![101.0], vec![105.0], vec![110.0]];
-        let f = paradigm_window_features(&window, 3);
+        let sr = 10.0;
+        let f = paradigm_window_features(&window, 3, sr);
         let r0: f64 = (100.0 + 100.0 + 101.0) / 3.0;
         let exp_delta = (105.0 - r0).abs().max((110.0 - r0).abs()) / r0;
         assert!((f[0] - exp_delta).abs() < 1e-12, "delta_ratio {} vs {}", f[0], exp_delta);
         // last_mean = mean [105,110] = 107.5 > r0*1.02 -> direction up
         assert_eq!(f[1], 1.0);
         let diffs = [0.0f64, 1.0, 4.0, 5.0];
-        let exp_slope = diffs.iter().map(|d| d.abs()).sum::<f64>() / 4.0 / r0;
+        // Reference: mean(|diff|) * sr / R0 (per-second slope).
+        let exp_slope = diffs.iter().map(|d| d.abs()).sum::<f64>() / 4.0 / r0 * sr;
         assert!((f[2] - exp_slope).abs() < 1e-12, "mean_slope {} vs {}", f[2], exp_slope);
+        // Reference: trapz(|v-R0|/R0) / sr (true time integral in seconds).
+        let norm: Vec<f64> = window.iter().map(|s| (s[0] - r0).abs() / r0).collect();
+        let exp_auc = trapezoid(&norm) / sr;
+        assert!((f[3] - exp_auc).abs() < 1e-12, "auc {} vs {}", f[3], exp_auc);
         assert_eq!(f.len(), 5);
     }
 
     #[test]
     fn test_paradigm_dead_channel_zeroes() {
         let window = vec![vec![0.0, 5.0], vec![0.0, 6.0], vec![0.0, 5.5]];
-        let f = paradigm_window_features(&window, 3);
+        let f = paradigm_window_features(&window, 3, 10.0);
         assert_eq!(f.len(), 10);
         assert_eq!(&f[..5], &[0.0; 5]);
         assert!(f[5..].iter().any(|&v| v != 0.0));
@@ -1712,7 +1737,7 @@ mod tests {
         // for a novel window (independent reimplementation of the math).
         let win = recording("ginger", 100, 950.0, 4.0, 3).samples;
         let native = model.predict_proba(&win).unwrap();
-        let raw = extract_window_features_by_mode(&win, &exp.metadata.feature_mode, exp.metadata.r0_samples, 10.0);
+        let raw = extract_window_features_by_mode(&win, &exp.metadata.feature_mode, exp.metadata.r0_samples, exp.metadata.sr);
         let scaled: Vec<f64> = raw
             .iter()
             .zip(exp.preprocessing.mean.iter().zip(exp.preprocessing.scale.iter()))

@@ -640,6 +640,9 @@ fn configs() -> Vec<(String, DetCfg)> {
                     alpha: a,
                     threshold_sigma: t,
                     min_votes: 2,
+                    // Monte-Carlo streams are generated at 10 Hz.
+                    sample_period_s: 0.1,
+                    confirm_window_s: 0.0,
                 }),
             ));
         }

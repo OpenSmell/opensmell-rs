@@ -405,7 +405,10 @@ fn compute_channel_device_agnostic(series: &[f64], r0_samples: usize, sr: f64, r
     }
 
     let absnorm: Vec<f64> = norm.iter().map(|v| v.abs()).collect();
-    let auc = trapezoid(&absnorm);
+    // Unit-spaced trapezoid integral converted to a true time integral via
+    // (1/sr) — consistent with rise_time/decay_time/response_latency which are
+    // already expressed in seconds. Same physical event -> same AUC at any fs.
+    let auc = trapezoid(&absnorm) / sr.max(1e-9);
     let endpoint_delta = (series[series.len() - 1] - r0) / r0;
 
     DeviceAgnostic {

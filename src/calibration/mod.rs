@@ -3,8 +3,10 @@ use crate::{Result, OpenSmellError};
 
 use crate::anomaly::EngineConfig;
 
-/// Stream cadence the engine assumes (10 Hz) — matches `dual.rs::SAMPLE_PERIOD_S`.
-const SAMPLE_PERIOD_S: f64 = 0.1;
+/// Stream cadence the engine assumes by default (10 Hz) — matches
+/// `dual.rs::SAMPLE_PERIOD_S`. The `*_at` fit variants let a deployment state
+/// its real cadence instead of assuming 10 Hz.
+pub const SAMPLE_PERIOD_S: f64 = 0.1;
 
 /// Calibration profile for a sensor rig.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +25,42 @@ pub struct CalibrationProfile {
     pub cartridge_ids: Vec<String>,
     /// Calibration quality score (0.0-1.0).
     pub quality: f64,
+    /// Phase-2 device profile: physics/decision knobs tuned on this device plus
+    /// the verification evidence that made it deployable (0-FA on held-out
+    /// clean seconds). Kept local-first; only the class physics is synced.
+    #[serde(default)]
+    pub verification: DeviceCalibrationProfile,
+}
+
+/// Per-device calibration-transfer profile (Phase 2).
+///
+/// Local-first: every field here is fitted/verified *on the device itself*.
+/// The sync layer publishes only [`DeviceCalibrationProfile::class_physics`]
+/// to the fleet (shared across a sensor cartridge type); the R (`baseline_std`)
+/// and verification metadata always stay local, since Phase-1.3 showed
+/// transplanting another device's noise floor destroys the 20 ms false-alarm
+/// ceiling. Serialized/deserialized as part of [`CalibrationProfile`], so a
+/// physical store or Data Hub connector round-trips the whole thing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeviceCalibrationProfile {
+    /// Class-level physics shared by this cartridge/sensor type: process walk
+    /// noise (q_state), parameter walk (q_param), desorption memory (τ), and
+    /// response exponent (α) where a sweep exists. The only synced part.
+    pub class_physics: Option<EngineConfig>,
+    /// Wall-clock persistence gate (seconds) that verified-to-0-FA, if the
+    /// verdict used one (the dual `--confirm-s` / EWMA confirmation window).
+    pub confirm_s: f64,
+    /// Minimum corroborating channels for a verdict.
+    pub min_channels: usize,
+    /// Clean window length (seconds) used to fit the profile on first boot.
+    pub warmup_s: f64,
+    /// Held-out clean verified till (unix seconds) and the measured 0-FA / FA
+    /// per month over it, before alarming is allowed to arm.
+    pub verified_clean_until: f64,
+    pub verified_fa_per_month: f64,
+    /// True once verification passed (0-FA over a clean window that was *not*
+    /// part of the fit) and alarming may arm.
+    pub verified: bool,
 }
 
 /// Sensor swap event record.
@@ -65,6 +103,7 @@ impl Calibrator {
                 device_id,
                 cartridge_ids: vec![String::new(); n_channels],
                 quality: 0.0,
+                verification: DeviceCalibrationProfile::default(),
             },
             swap_history: Vec::new(),
         }
@@ -114,8 +153,18 @@ impl Calibrator {
             device_id: self.profile.device_id.clone(),
             cartridge_ids: self.profile.cartridge_ids.clone(),
             quality,
+            verification: self.profile.verification.clone(),
         };
         Ok(())
+    }
+
+    /// Phase-2 verification gate: mark a profile deployable only after a clean
+    /// window *not used in the fit* measured `fa_per_month` under the profile's
+    /// physics. Until `verified`, a deployment must not arm alarming.
+    pub fn verify(&mut self, fa_per_month: f64, until: f64) {
+        self.profile.verification.verified_fa_per_month = fa_per_month;
+        self.profile.verification.verified_clean_until = until;
+        self.profile.verification.verified = fa_per_month < 1.0; // ≤ 1 FA s/mo
     }
 
     /// Execute a sensor cartridge swap.
@@ -336,8 +385,17 @@ impl AutoTune {
     /// Fit `q_param` from a drift path: `(time_seconds, per-channel level)`
     /// samples of how the baseline wandered (e.g. hourly medians over 24 h).
     /// The per-sample walk variance is the drift path's first-difference
-    /// variance divided by the number of 10 Hz samples each gap spans.
+    /// variance divided by the number of samples each gap spans at the
+    /// detector's reference cadence (default 10 Hz).
     pub fn with_drift(&mut self, drift: &[(f64, Vec<f64>)]) -> Result<&mut Self> {
+        self.with_drift_at(drift, SAMPLE_PERIOD_S)
+    }
+
+    /// `with_drift` at a real sampling cadence `period_s` (seconds). Fitted
+    /// `q_param` is quoted per sample at that cadence — the caller should set
+    /// `EngineConfig::sample_period_s` to the same `period_s` so the engine's
+    /// `dt/period` scaling reproduces the physical per-second drift rate.
+    pub fn with_drift_at(&mut self, drift: &[(f64, Vec<f64>)], period_s: f64) -> Result<&mut Self> {
         if drift.len() < 2 {
             return Err(OpenSmellError::InsufficientData { expected: 2, actual: drift.len() });
         }
@@ -345,6 +403,7 @@ impl AutoTune {
         if c == 0 {
             return Err(OpenSmellError::InsufficientData { expected: 1, actual: 0 });
         }
+        let period = period_s.max(1e-6);
         let mut q = 0.0;
         let mut gap_samples = 0.0;
         for w in drift.windows(2) {
@@ -353,7 +412,7 @@ impl AutoTune {
             if t1 <= t0 {
                 continue;
             }
-            gap_samples += (t1 - t0) / SAMPLE_PERIOD_S;
+            gap_samples += (t1 - t0) / period;
             for i in 0..c {
                 let d = l1[i] - l0[i];
                 q += d * d;
@@ -371,10 +430,18 @@ impl AutoTune {
     /// (`y(t)−y(t+Δt) = A·e^(−t/τ)·(1−e^(−Δt/τ))`), so `ln(Δy)` is regressed
     /// against t and τ = −Δt/slope without estimating the asymptote.
     pub fn with_desorption(&mut self, tail: &[Vec<f64>]) -> Result<&mut Self> {
+        self.with_desorption_at(tail, SAMPLE_PERIOD_S)
+    }
+
+    /// `with_desorption` at a real sampling cadence `period_s` (seconds) — the
+    /// time axis of the points `(k·period_s, ln Δy)` regressed for τ.
+    /// Recovered τ is in physical seconds regardless of cadence.
+    pub fn with_desorption_at(&mut self, tail: &[Vec<f64>], period_s: f64) -> Result<&mut Self> {
         if tail.len() < 3 {
             return Err(OpenSmellError::InsufficientData { expected: 3, actual: tail.len() });
         }
         let c = tail[0].len();
+        let period = period_s.max(1e-6);
         self.tau_s = (0..c)
             .map(|i| {
                 let mut pts: Vec<(f64, f64)> = tail
@@ -383,7 +450,7 @@ impl AutoTune {
                     .filter_map(|(k, w)| {
                         let d = w[0][i] - w[1][i];
                         if d > 1e-9 {
-                            Some((k as f64 * SAMPLE_PERIOD_S, d.ln()))
+                            Some((k as f64 * period, d.ln()))
                         } else {
                             None
                         }
@@ -570,6 +637,66 @@ mod tests {
     }
 
     #[test]
+    fn tau_recovery_is_cadence_invariant_in_seconds() {
+        // Recovered τ is a physical time constant: fitting the same 120 s tail
+        // sampled every 0.1 s or every 0.5 s must yield the same τ.
+        let tau_true = 50.0;
+        let recover = |period: f64| -> f64 {
+            let n = (120.0 / period) as usize;
+            let tail: Vec<Vec<f64>> = (0..n)
+                .map(|k| {
+                    let t = k as f64 * period;
+                    vec![1.0 + (-t / tau_true).exp()]
+                })
+                .collect();
+            let mut t = AutoTune {
+                baseline_std: vec![1.0],
+                ..Default::default()
+            };
+            t.with_desorption_at(&tail, period).unwrap();
+            t.tau_s[0]
+        };
+        let t10 = recover(SAMPLE_PERIOD_S);
+        let t50 = recover(0.5);
+        assert!((t10 - tau_true).abs() < 10.0, "10 Hz fit recovers {t10}");
+        assert!((t50 - tau_true).abs() < 10.0, "0.5 s-cadence fit recovers {t50}");
+        assert!(
+            (t10 - t50).abs() < 5.0,
+            "recovered τ must not depend on cadence (0.1→{t10}, 0.5→{t50})"
+        );
+    }
+
+    #[test]
+    fn drift_q_scales_with_cadence_keeping_per_second_rate() {
+        // `with_drift_at(period)` quotes q per sample: over a fixed wall-clock
+        // drift the per-second rate must be identical at any sampling cadence,
+        // i.e. q(period)/period is constant.
+        let mut drift = Vec::with_capacity(25);
+        for k in 0..25 {
+            let lev = 1.0 + 0.2 * ((k as f64 * 0.7).sin());
+            drift.push((k as f64 * 3600.0, vec![lev]));
+        }
+        let mut fast = AutoTune {
+            q_state: 1e-3,
+            baseline_std: vec![1.0],
+            ..Default::default()
+        };
+        fast.with_drift_at(&drift, SAMPLE_PERIOD_S).unwrap();
+        let mut slow = AutoTune {
+            q_state: 1e-3,
+            baseline_std: vec![1.0],
+            ..Default::default()
+        };
+        slow.with_drift_at(&drift, 1.0).unwrap();
+        let rate_fast = fast.q_param / SAMPLE_PERIOD_S;
+        let rate_slow = slow.q_param / 1.0;
+        assert!(
+            (rate_fast - rate_slow).abs() / rate_fast.max(1e-12) < 1e-6,
+            "per-second drift rate must be cadence-invariant ({rate_fast} vs {rate_slow})"
+        );
+    }
+
+    #[test]
     fn alpha_loglog_recovers_exponent() {
         // True α = 0.5: y = 2·x^0.5 at known levels x = 1, 4, 16.
         let mut t = AutoTune::default();
@@ -607,5 +734,24 @@ mod tests {
         // Feature switches stay caller-controlled (auto-tune only fills params).
         assert!(config.adsorption.enabled);
         assert!(config.response.power_law_enabled);
+    }
+
+    #[test]
+    fn verification_gate_arms_only_under_budget() {
+        let mut c = Calibrator::zero_calibration("dev-1".into(), 3);
+        let samples = vec![vec![1000.0, 900.0, 800.0]; 40];
+        c.calibrate(&samples, 1000.0).unwrap();
+
+        c.verify(931.4, 2000.0);
+        assert!(!c.profile.verification.verified);
+        assert_eq!(c.profile.verification.verified_fa_per_month, 931.4);
+
+        c.verify(0.0, 3000.0);
+        assert!(c.profile.verification.verified);
+        assert_eq!(c.profile.verification.verified_clean_until, 3000.0);
+
+        let round = serde_json::to_value(&c.profile).unwrap();
+        let back: CalibrationProfile = serde_json::from_value(round).unwrap();
+        assert!(back.verification.verified);
     }
 }

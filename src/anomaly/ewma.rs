@@ -16,12 +16,35 @@ use crate::{OpenSmellError, Result};
 /// Tuning surface for the control chart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EwmaConfig {
-    /// EWMA weight on the reading and on the squared residual (per update).
+    /// EWMA weight on the reading and on the squared residual, per reference-
+    /// cadence sample. Scaled to the actual inter-reading gap at update time so
+    /// a slow-logged stream smooths at the same physical time constant.
     pub alpha: f64,
     /// Sample is anomalous when a channel's |z| exceeds this many sigma.
     pub threshold_sigma: f64,
     /// Minimum number of simultaneously-exceeding channels for a vote.
     pub min_votes: usize,
+    /// Reference cadence `alpha` is quoted at (default 10 Hz). `update_with_dt`
+    /// folds the true gap to this cadence.
+    #[serde(default = "default_sample_period_s")]
+    pub sample_period_s: f64,
+    /// Wall-clock confirmation window: a raw per-sample vote (≥ `min_votes`
+    /// channels) only hardens into an anomaly after it has *persisted*
+    /// `confirm_window_s` seconds of real time (accumulated via `dt_s`). 0.0
+    /// disables confirmation (a single-sample vote fires immediately — the
+    /// legacy behaviour). At any cadence, an episode must endure the same
+    /// physical window before the decision layer asserts it, so a ~6 s TADI
+    /// logger and a 10 Hz stream share one decision time constant.
+    #[serde(default)]
+    pub confirm_window_s: f64,
+}
+
+fn default_sample_period_s() -> f64 {
+    0.1
+}
+
+fn default_confirm_window_s() -> f64 {
+    0.0
 }
 
 impl Default for EwmaConfig {
@@ -30,6 +53,8 @@ impl Default for EwmaConfig {
             alpha: 0.05,
             threshold_sigma: 5.0,
             min_votes: 2,
+            sample_period_s: default_sample_period_s(),
+            confirm_window_s: default_confirm_window_s(),
         }
     }
 }
@@ -41,6 +66,10 @@ pub struct EwmaVerdict {
     pub max_z: f64,
     pub z_scores: Vec<f64>,
     pub anomaly_votes: usize,
+    /// Wall-clock seconds the raw vote has persisted (only meaningful when
+    /// `confirm_window_s` is configured).
+    #[serde(default)]
+    pub confirm_hold_s: f64,
 }
 
 /// Streaming EWMA control chart over `n_channels` parallel channels.
@@ -51,6 +80,9 @@ pub struct EwmaControlChart {
     mu: Vec<f64>,
     var: Vec<f64>,
     calibrated: bool,
+    /// Wall-clock seconds the current raw vote has persisted without an
+    /// intervening normal sample (drives `confirm_window_s` gating).
+    confirm_hold_s: f64,
 }
 
 impl EwmaControlChart {
@@ -62,6 +94,7 @@ impl EwmaControlChart {
             mu: vec![0.0; n_channels],
             var: vec![1e-12; n_channels],
             calibrated: false,
+            confirm_hold_s: 0.0,
         }
     }
 
@@ -109,9 +142,20 @@ impl EwmaControlChart {
         Ok(())
     }
 
-    /// Score one reading (causal: state before this sample drives the verdict,
-    /// then the baseline updates from it).
+    /// Score one reading with the reference-cadence assumption (dt = the
+    /// configured `sample_period_s`). Applies the confirmation window over the
+    /// reference time constant.
     pub fn detect(&mut self, reading: &[f64]) -> Result<EwmaVerdict> {
+        self.detect_with_dt(reading, self.config.sample_period_s.max(1e-6))
+    }
+
+    /// Score one reading `dt_s` seconds after the previous one. The verdict is
+    /// gated by a wall-clock confirmation window: a raw vote (≥ `min_votes`
+    /// channels) only asserts `is_anomaly` after it has persisted
+    /// `confirm_window_s` seconds of accumulated inter-sample time. A slow-
+    /// logged (e.g. 6 s TADI) stream and a 10 Hz stream then demand the same
+    /// physical episode length before the decision layer fires.
+    pub fn detect_with_dt(&mut self, reading: &[f64], dt_s: f64) -> Result<EwmaVerdict> {
         if !self.calibrated {
             return Err(OpenSmellError::AnomalyDetection(
                 "EwmaControlChart used before calibrate".to_string(),
@@ -138,17 +182,48 @@ impl EwmaControlChart {
                 max_z = a;
             }
         }
+        // Wall-clock persistence gate (pure decision layer, no baseline effect).
+        let raw_anomaly = votes >= self.config.min_votes;
+        if self.config.confirm_window_s > 0.0 {
+            if raw_anomaly {
+                self.confirm_hold_s += dt_s.max(1e-6);
+            } else {
+                self.confirm_hold_s = 0.0;
+            }
+        }
+        let confirmed = if self.config.confirm_window_s > 0.0 {
+            self.confirm_hold_s + 1e-9 >= self.config.confirm_window_s
+        } else {
+            raw_anomaly
+        };
         Ok(EwmaVerdict {
-            is_anomaly: votes >= self.config.min_votes,
+            is_anomaly: confirmed,
             max_z,
             z_scores,
             anomaly_votes: votes,
+            confirm_hold_s: self.confirm_hold_s,
         })
     }
 
     /// Advance the baseline by one reading (called after `detect`).
     pub fn update(&mut self, reading: &[f64]) {
-        let a = self.config.alpha;
+        self.update_with_dt(reading, self.config.sample_period_s.max(1e-6))
+    }
+
+    /// Advance the baseline by one reading taken `dt_s` seconds after the
+    /// previous one. The EWMA weight is per physical time: over a longer gap
+    /// the baseline chases harder (`∑α = α·dt/period`), so a slow-logged
+    /// stream smooths over the same wall-clock window it would at 10 Hz.
+    pub fn update_with_dt(&mut self, reading: &[f64], dt_s: f64) {
+        let period = self.config.sample_period_s.max(1e-6);
+        let dr = (dt_s.max(1e-6) / period).max(1e-6);
+        // At the reference cadence use the configured α exactly (byte-identical
+        // to the legacy per-sample update).
+        let a = if dr == 1.0 {
+            self.config.alpha
+        } else {
+            1.0 - (1.0 - self.config.alpha).powf(dr)
+        };
         let inv = 1.0 - a;
         for (i, &x) in reading.iter().enumerate().take(self.n_channels) {
             let res = x - self.mu[i];
@@ -184,10 +259,12 @@ mod tests {
         let mut c = EwmaControlChart::with_config(
             1,
             EwmaConfig {
-                alpha: 0.05,
-                threshold_sigma: 4.0,
-                min_votes: 1,
-            },
+                    alpha: 0.05,
+                    threshold_sigma: 4.0,
+                    min_votes: 1,
+                    sample_period_s: 0.1,
+                    confirm_window_s: 0.0,
+                },
         );
         c.calibrate(&vec![vec![1.0]; 200]).unwrap();
         let mut fired = false;
@@ -203,5 +280,90 @@ mod tests {
     fn uncalibrated_is_an_error() {
         let mut c = EwmaControlChart::new(1);
         assert!(c.detect(&[1.0]).is_err());
+    }
+
+    #[test]
+    fn update_with_dt_at_reference_cadence_is_identical_to_update() {
+        let mut a = EwmaControlChart::new(2);
+        a.calibrate(&vec![vec![10.0; 2]; 100]).unwrap();
+        let mut b = EwmaControlChart::new(2);
+        b.calibrate(&vec![vec![10.0; 2]; 100]).unwrap();
+        for &r in &[10.6_f64, 10.2, 9.7, 11.1, 10.3] {
+            a.update(&[r, r]);
+            b.update_with_dt(&[r, r], 0.1);
+            assert_eq!(a.mu, b.mu, "mu byte-identical at reference cadence");
+            assert_eq!(a.var, b.var, "var byte-identical at reference cadence");
+        }
+    }
+
+    #[test]
+    fn update_with_dt_is_time_homogeneous_for_mean() {
+        // Geometric-EWMA invariant: one 0.5 s step moves the level exactly like
+        // five 0.1 s steps, since (1−α)^(5·dr=5) applied once equals α stepped
+        // five times. (The variance is *not* identical — residuals are taken
+        // against the moving mean — so only the level must match.)
+        let mut one = EwmaControlChart::new(1);
+        one.calibrate(&vec![vec![1.0]; 200]).unwrap();
+        let mut five = EwmaControlChart::new(1);
+        five.calibrate(&vec![vec![1.0]; 200]).unwrap();
+        one.detect(&[2.5]).unwrap();
+        one.update_with_dt(&[2.5], 0.5);
+        five.detect(&[2.5]).unwrap();
+        for _ in 0..5 {
+            five.update_with_dt(&[2.5], 0.1);
+        }
+        assert!((one.mu[0] - five.mu[0]).abs() < 1e-9, "level: 1×0.5 s ≡ 5×0.1 s");
+        assert!(one.var[0].is_finite() && one.var[0] > 0.0);
+        assert!(five.var[0].is_finite() && five.var[0] > 0.0);
+    }
+
+    #[test]
+    fn confirm_window_gates_on_wall_clock_not_sample_count() {
+        // A strong step produces a transient multi-sample vote (the EWMA's
+        // variance inflates and the baseline absorbs it after a few samples —
+        // exactly why single-sample blips are the FP mechanism). With
+        // confirm_window_s = 0.2 s the decision must fire on the reading that
+        // crosses 0.2 s of *accumulated* anomaly: sample 2 at 10 Hz (2 × 0.1 s)
+        // but sample 1 at 6 s cadence (1 × 6 s). Same wall-clock recipe,
+        // different sample counts — that IS the cadence invariance.
+        let cfg = |window: f64| EwmaConfig {
+            alpha: 0.05,
+            threshold_sigma: 4.0,
+            min_votes: 1,
+            sample_period_s: 0.1,
+            confirm_window_s: window,
+        };
+        let step = vec![1.0e6];
+        let fire_on_sample = |dt: f64| {
+            let mut c = EwmaControlChart::with_config(1, cfg(0.2));
+            c.calibrate(&vec![vec![1.0]; 200]).unwrap();
+            for k in 0..8 {
+                let v = c.detect_with_dt(&step, dt).unwrap();
+                if v.is_anomaly {
+                    return (k + 1, v.confirm_hold_s);
+                }
+                c.update_with_dt(&step, dt);
+            }
+            panic!("window never fired at dt={dt}");
+        };
+        let (n10, hold10) = fire_on_sample(0.1);
+        assert_eq!(n10, 2, "10 Hz crosses 0.2 s on the 2nd sample");
+        assert!(hold10 >= 0.2, "10 Hz hold {hold10}");
+        let (n6, hold6) = fire_on_sample(6.0);
+        assert_eq!(n6, 1, "6 s cadence crosses 0.2 s on its 1st reading (6 s > 0.2 s)");
+        assert!(hold6 >= 0.2, "6 s hold {hold6}");
+        // A normal sample in between resets the persistence: an episode shorter
+        // than the window must NOT fire even though a raw vote occurred.
+        let mut c = EwmaControlChart::with_config(1, cfg(6.0));
+        c.calibrate(&vec![vec![1.0]; 200]).unwrap();
+        assert!(!c.detect_with_dt(&step, 0.1).unwrap().is_anomaly, "0.1 s < 6 s window");
+        c.update_with_dt(&step, 0.1);
+        c.update_with_dt(&[1.0], 0.1); // normal sample resets the window
+        assert!(!c.detect_with_dt(&step, 0.1).unwrap().is_anomaly, "reset must not fire");
+        // Disabled (legacy): a lone single-sample vote fires immediately.
+        let mut c0 = EwmaControlChart::with_config(1, cfg(0.0));
+        c0.calibrate(&vec![vec![1.0]; 200]).unwrap();
+        assert!(c0.detect_with_dt(&step, 6.0).unwrap().is_anomaly,
+            "legacy single-sample vote must fire instantly");
     }
 }

@@ -49,15 +49,28 @@ const K_MAX: usize = 3;
 /// Configuration for the regime model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegimeConfig {
-    /// Forgetting factor per sample: `weight *= (1 − β)` for untouched clusters.
+    /// Forgetting factor per reference-cadence sample: `weight *= (1 − β)`.
+    /// Scaled to the actual inter-reading gap at update time so a slow-logged
+    /// stream forgets at the same physical rate.
     pub beta: f64,
-    /// Minimum persistence (samples) before a novel region spawns a cluster.
+    /// Minimum persistence (reference-cadence samples) before a novel region
+    /// spawns a cluster. Interpreting the "how long has this normal lasted?"
+    /// windows in seconds (via `sample_period_s`) keeps them physical at any
+    /// cadence — 300 samples means 30 s at the reference 10 Hz.
     pub min_samples: usize,
     /// Minimum persistence in a different known cluster before a switch is
     /// declared (filters single-sample flicker).
     pub switch_samples: usize,
     /// Chi-square quantile used as the "join" threshold.
     pub join_quantile: f64,
+    /// Reference cadence `update` assumes per count of `min_samples` /
+    /// `switch_samples`. Defaults to the engine's 10 Hz.
+    #[serde(default = "default_sample_period_s")]
+    pub sample_period_s: f64,
+}
+
+fn default_sample_period_s() -> f64 {
+    0.1
 }
 
 impl Default for RegimeConfig {
@@ -67,6 +80,7 @@ impl Default for RegimeConfig {
             min_samples: 300,
             switch_samples: 30,
             join_quantile: 0.95,
+            sample_period_s: default_sample_period_s(),
         }
     }
 }
@@ -78,12 +92,13 @@ pub struct RegimeModel {
     pub transitions: Vec<RegimeTransition>,
     pub config: RegimeConfig,
     n_channels: usize,
-    // Novel-region persistence bookkeeping.
-    novel_samples: usize,
+    // Novel-region persistence bookkeeping (in reference-cadence samples;
+    // `update` accumulates `dt / sample_period_s` per call).
+    novel_samples: f64,
     novel_sum: Vec<f64>,
     // Switch-candidate bookkeeping.
     candidate_switch: Option<usize>,
-    candidate_samples: usize,
+    candidate_samples: f64,
 }
 
 /// Chi-square critical value via the Wilson–Hilferty approximation
@@ -124,10 +139,10 @@ impl RegimeModel {
             transitions: Vec::new(),
             config,
             n_channels,
-            novel_samples: 0,
+            novel_samples: 0.0,
             novel_sum: vec![0.0; n_channels],
             candidate_switch: None,
-            candidate_samples: 0,
+            candidate_samples: 0.0,
         }
     }
 
@@ -140,14 +155,18 @@ impl RegimeModel {
             weight: 1.0,
         });
         self.current = 0;
-        self.novel_samples = 0;
+        self.novel_samples = 0.0;
         self.novel_sum = vec![0.0; self.n_channels];
         self.candidate_switch = None;
-        self.candidate_samples = 0;
+        self.candidate_samples = 0.0;
     }
 
-    /// Online update with one sample of the (environmental) reference state.
-    pub fn update(&mut self, x: &[f64]) -> Result<RegimeUpdate> {
+    /// Online update with one sample of the (environmental) reference state,
+    /// taken `dt_s` seconds after the previous one. Persistence windows and
+    /// the forgetting factor are expressed at `sample_period_s` cadence and
+    /// scaled to `dt_s`, so novelty thresholds (`min_samples` = 30 s at 10 Hz)
+    /// stay physical for a stream sampled at any rate.
+    pub fn update(&mut self, x: &[f64], dt_s: f64) -> Result<RegimeUpdate> {
         if x.len() != self.n_channels {
             return Err(OpenSmellError::InvalidChannelCount {
                 got: x.len(),
@@ -162,9 +181,25 @@ impl RegimeModel {
             });
         }
 
+        // Reference-cadence-equivalent sample count this `dt` represents.
+        // At the reference cadence accumulate by exactly 1.0 (byte-identical to
+        // the legacy per-sample counters).
+        let dr = (dt_s / self.config.sample_period_s.max(1e-9)).max(1e-6);
+        let at_ref = dr == 1.0;
+        let beta_dt = if at_ref {
+            self.config.beta
+        } else {
+            1.0 - (1.0 - self.config.beta).powf(dr)
+        };
+        let learn_dt = if at_ref {
+            self.config.beta.max(1e-3)
+        } else {
+            1.0 - (1.0 - self.config.beta.max(1e-3)).powf(dr)
+        };
+
         // Forgetting: untouched clusters fade; the joined one refreshes.
         for c in &mut self.clusters {
-            c.weight *= 1.0 - self.config.beta;
+            c.weight *= 1.0 - beta_dt;
         }
 
         // Nearest-cluster membership using Mahalanobis distance (ridge-guarded).
@@ -187,18 +222,18 @@ impl RegimeModel {
         // Novel region bookkeeping (below the join threshold for every cluster).
         let mut update = RegimeUpdate::default();
         if best_d2 > join_thr {
-            self.novel_samples += 1;
+            self.novel_samples += dr;
             for (i, &v) in x.iter().enumerate() {
                 self.novel_sum[i] += v;
             }
             self.candidate_switch = None;
-            self.candidate_samples = 0;
+            self.candidate_samples = 0.0;
 
-            if self.novel_samples >= self.config.min_samples && self.clusters.len() < K_MAX {
+            if self.novel_samples >= self.config.min_samples as f64 && self.clusters.len() < K_MAX {
                 let mean: Vec<f64> = self
                     .novel_sum
                     .iter()
-                    .map(|s| s / self.novel_samples as f64)
+                    .map(|s| s / self.novel_samples)
                     .collect();
                 let mut cov = vec![vec![0.0; self.n_channels]; self.n_channels];
                 for &v in self.novel_sum.iter() {
@@ -210,7 +245,7 @@ impl RegimeModel {
                     cov,
                     weight: 1.0,
                 });
-                self.novel_samples = 0;
+                self.novel_samples = 0.0;
                 let idx = self.clusters.len() - 1;
                 self.current = idx;
                 update = RegimeUpdate {
@@ -226,7 +261,7 @@ impl RegimeModel {
 
         // Join the best cluster (rolling center, forgetting history).
         let c = &mut self.clusters[best_idx];
-        let a = self.config.beta.max(1e-3);
+        let a = learn_dt;
         for (i, &v) in x.iter().enumerate() {
             c.mean[i] += a * (v - c.mean[i]);
         }
@@ -238,26 +273,26 @@ impl RegimeModel {
                 c.cov[i][j] += a * (diff[i] * diff[j] - c.cov[i][j]) / eff.max(1.0);
             }
         }
-        c.weight = (c.weight + 1.0).min(1e6);
-        self.novel_samples = 0;
+        c.weight = (c.weight + dr).min(1e6);
+        self.novel_samples = 0.0;
         self.novel_sum = vec![0.0; self.n_channels];
 
         // Switch-candidate tracking.
         if best_idx != self.current {
             if self.candidate_switch != Some(best_idx) {
                 self.candidate_switch = Some(best_idx);
-                self.candidate_samples = 1;
+                self.candidate_samples = dr;
             } else {
-                self.candidate_samples += 1;
+                self.candidate_samples += dr;
             }
-            if self.candidate_samples >= self.config.switch_samples {
+            if self.candidate_samples >= self.config.switch_samples as f64 {
                 let from = self.current;
                 let to = best_idx;
                 self.register_transition(from, to);
                 let anchor = self.clusters[to].clone();
                 self.current = to;
                 self.candidate_switch = None;
-                self.candidate_samples = 0;
+                self.candidate_samples = 0.0;
                 update = RegimeUpdate {
                     regime: to,
                     switched: true,
@@ -268,7 +303,7 @@ impl RegimeModel {
             }
         } else {
             self.candidate_switch = None;
-            self.candidate_samples = 0;
+            self.candidate_samples = 0.0;
             update = RegimeUpdate {
                 regime: best_idx,
                 switched: false,
@@ -339,7 +374,7 @@ mod tests {
         model.seed(vec![1.0, 2.0], vec![vec![0.1, 0.0], vec![0.0, 0.1]]);
         let mut update = RegimeUpdate::default();
         for _ in 0..100 {
-            update = model.update(&[1.02, 1.98]).unwrap();
+            update = model.update(&[1.02, 1.98], 0.1).unwrap();
         }
         assert!(!update.switched, "stable stream must not switch regimes");
         assert_eq!(model.current, 0);
@@ -354,7 +389,7 @@ mod tests {
         model.seed(vec![1.0, 2.0], vec![vec![0.05, 0.0], vec![0.0, 0.05]]);
         let mut spawned = false;
         for _ in 0..15 {
-            let u = model.update(&[9.0, 8.0]).unwrap();
+            let u = model.update(&[9.0, 8.0], 0.1).unwrap();
             spawned |= u.spawned;
         }
         assert!(spawned, "persistent novel region should spawn a new regime");
@@ -374,7 +409,7 @@ mod tests {
         let cfg = model.config.switch_samples;
         let mut u = RegimeUpdate::default();
         for _ in 0..cfg + 5 {
-            u = model.update(&[9.0, 8.0]).unwrap();
+            u = model.update(&[9.0, 8.0], 0.1).unwrap();
             if u.switched {
                 break;
             }

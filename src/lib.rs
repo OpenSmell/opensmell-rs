@@ -123,13 +123,14 @@ pub mod training;
 pub mod live;
 
 pub mod smellability;
-pub use features::{FeatureGroup, extract_features, extract_window_features, feature_names};
+pub use features::{FeatureGroup, extract_features, extract_features_with_sr,
+                   extract_window_features, extract_window_features_with_sr, feature_names};
 pub use anomaly::{AnomalyDetector, AnomalyScore, AnomalyMethod};
 pub use calibration::{AutoTune, Calibrator, CalibrationProfile, CrossDeviceCalibrator};
 pub use health::{HealthMonitor, SensorHealth, HealthStatus, FleetHealth, fisher_discriminant_ratio, pairwise_fdr, euclidean_distance, cosine_similarity, similarity_warning};
 pub use protocol::{OsmProtocol, OsmMessage};
 pub use preprocessing::{RawData, BaselineCorrection, BaselineMethod, SignalFilter, FilterType, WindowExtractor, DataValidator};
-pub use adaptive::{AdaptiveAnomalyDetector, AdaptiveThreshold, DetectionConfig, FailSafeSystem, LabelingSystem, DetectionResult, AccuracyImprovement, DetectorState, LabelingStats, FailSafeResult, LabelRecord};
+pub use adaptive::{AdaptiveAnomalyDetector, AdaptiveThreshold, DetectionConfig, FailSafeSystem, LabelingSystem, DetectionResult, AccuracyImprovement, DetectorState, LabelingStats, FailSafeResult, LabelRecord, WARMUP_SECONDS, STUCK_ZERO_SECONDS, WARNING_SECONDS, CRITICAL_SECONDS, EMERGENCY_SECONDS, RESET_NORMAL_SECONDS};
 pub use poisoning::{PoisoningDetector, SensorHealthConfig, SensorHealthStatus, SensorMetrics, DegradationType};
 pub use quality::{compute_quality, ChannelSeries, QualityParams, QualityReport};
 pub use training::{train_classifier, TrainOptions, TrainingReport, ClassifierModel, ModelCard,

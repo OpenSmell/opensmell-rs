@@ -79,12 +79,34 @@ pub use anomaly::*;
 
 use crate::{Baseline, SensorReading, Result};
 
+/// Default sampling rate (Hz) used when no cadence is known. Feature
+/// extraction that reads a time index — rise time, decay time, time-to-peak,
+/// response latency — divides the sample count by this rate. Callers with a
+/// real cadence must use [`extract_window_features_with_sr`] /
+/// [`extract_features_with_sr`] so time features come out in true seconds.
+pub const DEFAULT_FEATURE_SR: f64 = 10.0;
+
 /// Extract features from a single reading using specified feature groups.
+///
+/// Time-indexed features use [`DEFAULT_FEATURE_SR`]; use
+/// [`extract_features_with_sr`] when the ingestion cadence is known.
 pub fn extract_features(
     reading: &SensorReading,
     baseline: &Baseline,
     groups: &[FeatureGroup],
 ) -> Result<Vec<f64>> {
+    extract_features_with_sr(reading, baseline, groups, DEFAULT_FEATURE_SR)
+}
+
+/// Extract features from a single reading, converting sample-count time
+/// features (response latency) to seconds using `sr`.
+pub fn extract_features_with_sr(
+    reading: &SensorReading,
+    baseline: &Baseline,
+    groups: &[FeatureGroup],
+    sr: f64,
+) -> Result<Vec<f64>> {
+    let fs = if sr.is_finite() { sr.abs() } else { 1e-9 }.max(1e-9);
     let normalized = baseline.normalize(&reading.channels);
     let mut features = Vec::new();
 
@@ -95,7 +117,7 @@ pub fn extract_features(
             FeatureGroup::Health => health::extract(&normalized, &reading.channels, baseline)?,
             FeatureGroup::Kinetics => kinetics::extract(&normalized, &reading.channels, baseline)?,
             FeatureGroup::Selectivity => selectivity::extract(&normalized, &reading.channels, baseline)?,
-            FeatureGroup::Temporal => temporal::extract(&normalized, &reading.channels, baseline)?,
+            FeatureGroup::Temporal => temporal::extract(&normalized, &reading.channels, baseline, fs)?,
             FeatureGroup::Hardware => hardware::extract(&normalized, &reading.channels, baseline)?,
         };
         features.append(&mut group_features);
@@ -151,25 +173,45 @@ mod hardware {
 }
 
 /// Extract features from a time series window (for monitoring/anomaly detection).
+///
+/// Time-indexed features (rise/decay/latency/auc) are normalized to seconds
+/// using [`DEFAULT_FEATURE_SR`]. Use [`extract_window_features_with_sr`] when
+/// the actual ingestion cadence is known so features are cadence-invariant.
 pub fn extract_window_features(
     window: &[Vec<f64>],
     baseline: &Baseline,
     groups: &[FeatureGroup],
 ) -> Result<Vec<f64>> {
+    extract_window_features_with_sr(window, baseline, groups, DEFAULT_FEATURE_SR)
+}
+
+/// Extract features from a time series window, converting sample-count time
+/// features (rise time, decay time, time-to-peak, response latency, AUC,
+/// drift rate) to true time units using the sampling rate `sr` (Hz).
+///
+/// Fixes the cadence-implicit time bugs: the same physical event recorded at
+/// 10 Hz and 1 Hz now yields equal rise time, latency, AUC, and drift rate.
+pub fn extract_window_features_with_sr(
+    window: &[Vec<f64>],
+    baseline: &Baseline,
+    groups: &[FeatureGroup],
+    sr: f64,
+) -> Result<Vec<f64>> {
     if window.is_empty() {
         return Err(crate::OpenSmellError::InsufficientData { expected: 1, actual: 0 });
     }
+    let fs = if sr.is_finite() { sr.abs() } else { 1e-9 }.max(1e-9);
     let _n_channels = window[0].len();
     let mut features = Vec::new();
 
     for group in groups {
         let mut group_features = match group {
-            FeatureGroup::Anomaly => anomaly::extract_window(window, baseline)?,
-            FeatureGroup::Classification => classification::extract_window(window, baseline)?,
-            FeatureGroup::Health => health::extract_window(window, baseline)?,
-            FeatureGroup::Kinetics => kinetics::extract_window(window, baseline)?,
+            FeatureGroup::Anomaly => anomaly::extract_window_sr(window, baseline, fs)?,
+            FeatureGroup::Classification => classification::extract_window(window, baseline, fs)?,
+            FeatureGroup::Health => health::extract_window(window, baseline, fs)?,
+            FeatureGroup::Kinetics => kinetics::extract_window(window, baseline, fs)?,
             FeatureGroup::Selectivity => selectivity::extract_window(window, baseline)?,
-            FeatureGroup::Temporal => temporal::extract_window(window, baseline)?,
+            FeatureGroup::Temporal => temporal::extract_window(window, baseline, fs)?,
             FeatureGroup::Hardware => hardware_extract_window(window, baseline)?,
         };
         features.append(&mut group_features);

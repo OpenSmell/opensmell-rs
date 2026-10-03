@@ -8,12 +8,42 @@ use crate::{Baseline, Result, OpenSmellError};
 pub struct RawData {
     /// Raw readings: rows = time steps, columns = channels.
     pub samples: Vec<Vec<f64>>,
-    /// Sampling rate in Hz.
+    /// Sampling rate in Hz. Inferred from the median gap between consecutive
+    /// timestamps when a timestamp column exists (1/gap, timestamps in
+    /// seconds); falls back to 10.0 only when no timestamps are available.
     pub sample_rate: f64,
     /// Channel names (optional).
     pub channel_names: Vec<String>,
-    /// Timestamps (optional).
+    /// Timestamps (optional). When no timestamp column exists this stays empty;
+    /// the array index is never silently treated as seconds.
     pub timestamps: Vec<f64>,
+}
+
+/// Infer the nominal sampling rate (Hz) from the median positive gap between
+/// consecutive timestamps (in seconds), exactly like `crate::quality.rs` does
+/// for continuity. Returns `None` when there is no positive-gap evidence.
+fn infer_sample_rate(timestamps: &[f64]) -> Option<f64> {
+    let gaps: Vec<f64> = timestamps
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|g| *g > 0.0)
+        .collect();
+    if gaps.is_empty() {
+        return None;
+    }
+    let mut sorted = gaps;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let median_gap = if n.is_multiple_of(2) {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    } else {
+        sorted[n / 2]
+    };
+    if median_gap > 0.0 {
+        Some(1.0 / median_gap)
+    } else {
+        None
+    }
 }
 
 impl RawData {
@@ -28,13 +58,11 @@ impl RawData {
         for result in rdr.records() {
             let record = result?;
             let mut row = Vec::new();
-            let mut has_timestamp = false;
 
             for (i, field) in record.iter().enumerate() {
                 if let Ok(val) = field.parse::<f64>() {
                     if headers.get(i).map(|h| h.to_lowercase()).as_deref() == Some("timestamp") {
                         timestamps.push(val);
-                        has_timestamp = true;
                     } else {
                         row.push(val);
                     }
@@ -43,9 +71,6 @@ impl RawData {
 
             if !row.is_empty() {
                 samples.push(row);
-            }
-            if !has_timestamp && !samples.is_empty() {
-                timestamps.push(samples.len() as f64);
             }
         }
 
@@ -59,9 +84,18 @@ impl RawData {
             .cloned()
             .collect();
 
+        // Sampling rate: infer from the median timestamp gap. This replaces the
+        // old "default 10 Hz, never inferred" and the index-as-seconds fallback
+        // that silently seeded downstream time bugs at non-10 Hz cadences.
+        let sample_rate = if timestamps.is_empty() {
+            10.0
+        } else {
+            infer_sample_rate(&timestamps).unwrap_or(10.0)
+        };
+
         Ok(Self {
             samples,
-            sample_rate: 10.0, // Default 10 Hz, overridden if known
+            sample_rate,
             channel_names,
             timestamps,
         })
@@ -423,6 +457,7 @@ impl DataValidator {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use super::*;
 
     #[test]
@@ -463,5 +498,49 @@ mod tests {
         let windows = extractor.extract_windows(&data);
         assert_eq!(windows.len(), 3); // [0-9], [5-14], [10-19]
         assert_eq!(windows[0].len(), 10);
+    }
+
+    fn write_csv(csv: &str) -> String {
+        // Unique per call. Keying on process id alone collides across test
+        // threads, which made these tests fail roughly one run in five.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "opensmell_pp_{}_{}.csv",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, csv).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn from_csv_infers_rate_from_median_timestamp_gap() {
+        // 10 Hz cadence: timestamps 0.1 s apart.
+        let mut csv = String::from("timestamp,ch0,ch1\n");
+        for i in 0..20 {
+            csv.push_str(&format!("{:.1},{},100\n", i as f64 * 0.1, 100 + i));
+        }
+        let data = RawData::from_csv(&write_csv(&csv)).unwrap();
+        assert!((data.sample_rate - 10.0).abs() < 1e-9, "got {}", data.sample_rate);
+        assert_eq!(data.timestamps.len(), 20);
+
+        // 1 Hz cadence: 1.0 s apart.
+        let mut csv2 = String::from("timestamp,ch0\n");
+        for i in 0..20 {
+            csv2.push_str(&format!("{},{}\n", i, 100 + i));
+        }
+        let data2 = RawData::from_csv(&write_csv(&csv2)).unwrap();
+        assert!((data2.sample_rate - 1.0).abs() < 1e-9, "got {}", data2.sample_rate);
+    }
+
+    #[test]
+    fn from_csv_without_timestamps_falls_back_and_never_invents_seconds() {
+        let csv = String::from("ch0,ch1\n100,200\n101,201\n102,202\n");
+        let data = RawData::from_csv(&write_csv(&csv)).unwrap();
+        assert_eq!(data.sample_rate, 10.0, "10 Hz fallback only when no timestamps");
+        assert!(
+            data.timestamps.is_empty(),
+            "index must not be silently treated as seconds"
+        );
     }
 }

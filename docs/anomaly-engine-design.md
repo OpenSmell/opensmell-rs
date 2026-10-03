@@ -782,6 +782,14 @@ arrivals still carries residual gas, not background-only air).
 
 **Results (DualKalman, sens 2.0–4.0, 3 usable loggers, 63 releases):**
 
+> **FA accounting note (2026-09-24):** the FA/month column below uses the
+> legacy *sample-count* accounting (one alarmed sample = one "alarm", at the
+> corpus's own cadence-independent count). Each TADI sample spans ~6 s of wall
+> clock, so the honest *alarm-seconds* FA/month (see
+> `reports/tadi_threshold_latency.md` and `reports/tadi_cadence_rerun.md`) is
+> ≈ 6× these figures. The table is retained as an archived cross-corpus
+> snapshot; the 2026-09-24 re-run supercedes it for deployment decisions.
+
 | Sens | Detected/Total | Rate | Clean FPR | FA/month | Median latency |
 |------|---------------|------|-----------|----------|----------------|
 | 2.0  | 48/63         | 76%  | 4.1e-4    | 1,062    | 126 s          |

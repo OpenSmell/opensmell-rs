@@ -343,6 +343,9 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(2),
+        // Indoor-corpus streams are pre-binned at 10 Hz.
+        sample_period_s: 0.1,
+        confirm_window_s: 0.0,
     };
 
     let inductions = parse_metadata(meta_path);
