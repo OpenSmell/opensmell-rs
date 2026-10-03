@@ -3,8 +3,18 @@
 **Status.** All four benchmarks verified (Sep 16). Results in
 `reports/bench_dynamic_memory.json`, `reports/bench_detector_memory_fp.json`,
 `reports/bench_identifiability.json`, `reports/bench_features_audit.json`.
-Reproducible via `python benchmarks/run_all.py`. Companion documents:
-`anomaly-engine-design.md` (§11.12), `reports/README.md` (wave-4 table).
+Companion documents: `anomaly-engine-design.md` (§11.12), `reports/README.md`
+(wave-4 table).
+
+> **Reproducibility gap.** This document previously said "Reproducible via
+> `python benchmarks/run_all.py`". That script and the `benchmarks/` directory
+> are not in this repository, and `reports/` lives outside it and is untracked.
+> The result JSONs and this document are the only surviving record, so the
+> numbers below are currently unverifiable without the original analysis code.
+> The dataset is present and checksummed
+> (`e-nose-evals/data/dynamic-mixtures/PROVENANCE.md`), so re-deriving them is
+> possible — it just has not been done. Do not describe these results as
+> reproducible until the benchmark code is restored.
 
 ---
 
@@ -34,7 +44,13 @@ dynamic-mixtures (2×12 h, ground-truth schedule) and turbulent-mixtures
 ### What it measures
 
 A history-dependence audit on the UCI dynamic-mixtures ground-truth schedule.
-Three controlled questions, all at 1 Hz with per-second ground-truth ppm:
+Three controlled questions, all computed on a **1 Hz analysis grid** over a
+corpus acquired at **100 Hz** (measured median gap 0.0100 s; see
+`e-nose-evals/data/dynamic-mixtures/PROVENANCE.md`). The two rates must not be
+confused: 1 Hz is where this analysis chose to look, not what the hardware
+recorded. On this grid the resolvable event floor is 2 s, so the 1–2 s
+inter-transition intervals present in the corpus are not separable here and
+should be filtered rather than reported as transitions.
 
 | Question | Method |
 |----------|--------|
@@ -57,6 +73,15 @@ consistently negative correlation means **shorter gap ⇒ lower next
 response** in most device families. This is not a small perturbation — the
 effect size (median |r| ≈ 0.39) is comparable to the device-identity effect
 on same-type pairs.
+
+**The gap is not clean, and that is not incidental.** The corpus' own recovery
+fits put τ_slow at 45–60 s, while the recovered inter-transition interval has a
+median of 100 s — only 1.7–2.2 τ_slow — with p90 at 189–200 s. At the median
+transition the previous stimulus has decayed five to ninefold but has not
+returned to baseline. So this result measures **history dependence under
+realistic scheduling**, and the strength of the correlation is largely a
+statement about how short the schedule's gaps are. It is *not* a measurement of
+transition response in isolation, and should not be cited as one.
 
 **Priming** (self vs cross):
 
