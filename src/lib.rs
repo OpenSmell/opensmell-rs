@@ -116,6 +116,7 @@ pub mod framework;
 pub mod adaptive;
 pub mod poisoning;
 pub mod quality;
+pub mod timing;
 
 pub mod training;
 

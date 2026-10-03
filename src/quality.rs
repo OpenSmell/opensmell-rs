@@ -26,10 +26,16 @@
 //! `opensmell/docs/quality-weight-calibration.md`. Do not cite them as a measured
 //! optimum.
 //!
-//! Four defects were found during that study, all now fixed, and all four shared one
-//! shape: **each defect raised the score.** Noise, saturation, a dead channel, and a
-//! mislabelled time column each produced a better result for data that had got worse.
-//! Two of those are handled here:
+//! Four defects were found during that study, all now fixed. They come in two
+//! shapes. Noise, saturation, and a dead channel each **raised** the score:
+//! worse data scored better. The mislabelled time column did the opposite and is
+//! the more instructive of the two kinds -- it did not reward bad data, it made a
+//! clean recording score identically to a broken one, so a caller reading
+//! continuity 0 could not tell a mislabelled column from genuine packet loss.
+//! A score that improves for worse data is wrong, and a score that reports the
+//! same number for two opposite faults is not measuring anything.
+//!
+//! Three of those are handled here:
 //!
 //! - Dynamic-range span and the signal-strength peak are both measured over
 //!   *unclipped* samples only. A sample pinned at the converter rail carries no
