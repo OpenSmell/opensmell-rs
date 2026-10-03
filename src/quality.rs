@@ -18,6 +18,32 @@
 //! upper-rail clipping is not detectable and only the lower rail (`<= 0`) counts
 //! toward saturation. When `samplingRateHz` is undeclared, continuity uses the
 //! median gap as the nominal schedule.
+//!
+//! # PROVISIONAL WEIGHTS
+//!
+//! The values in [`WEIGHTS`] are **provisional and deliberately not calibrated**.
+//! Three calibration attempts failed for reasons documented in
+//! `opensmell/docs/quality-weight-calibration.md`. Do not cite them as a measured
+//! optimum.
+//!
+//! Four defects were found during that study, all now fixed, and all four shared one
+//! shape: **each defect raised the score.** Noise, saturation, a dead channel, and a
+//! mislabelled time column each produced a better result for data that had got worse.
+//! Two of those are handled here:
+//!
+//! - Dynamic-range span and the signal-strength peak are both measured over
+//!   *unclipped* samples only. A sample pinned at the converter rail carries no
+//!   amplitude information -- the true peak is unknown and lies above full scale --
+//!   so counting it as span or as peak made a saturated channel score a wider range
+//!   and a stronger signal than the same channel read in range. `saturationFree`
+//!   still reports the clipping. This requires `adcMax` to be declared.
+//! - Span is a robust 5th-95th percentile range minus three times the channel's
+//!   noise floor, the floor estimated from successive differences, so interference
+//!   cannot inflate the score.
+//! - Each dead channel costs [`DEAD_SENSOR_PENALTY`] off the total.
+//!
+//! One defect remains open and is the blocker for calibration: the subscores are not
+//! on a common scale. Compare subscores within a recording, not across devices.
 
 use std::collections::BTreeMap;
 
@@ -32,6 +58,22 @@ pub const SNR_TARGET: f64 = 10.0;
 pub const FULL_SCORE_DURATION_S: f64 = 60.0;
 pub const MIN_SPAN_FRACTION: f64 = 0.1;
 pub const GAP_TOLERANCE: f64 = 0.1;
+
+// The time column is assumed to be milliseconds. When `sampling_rate_hz` is
+// declared, the observed median gap should sit within these multiples of the
+// expected period. A ratio far from 1 means the column is probably in seconds
+// or microseconds, which is a unit fault rather than packet loss.
+pub const MIN_TIME_UNIT_RATIO: f64 = 0.5;
+pub const MAX_TIME_UNIT_RATIO: f64 = 2.0;
+
+// Dynamic range uses a robust 5th-95th percentile span minus this multiple of
+// the channel's noise floor, so an interference burst cannot raise the score.
+pub const NOISE_SPAN_TOLERANCE: f64 = 3.0;
+
+// Each dead sensing element costs this much of the total, because dead channels
+// are excluded from the live-channel means and exclusion would otherwise read
+// as an improvement.
+pub const DEAD_SENSOR_PENALTY: f64 = 12.5;
 
 pub const WEIGHTS: &[(&str, f64)] = &[
     ("continuity", 0.15),
@@ -110,6 +152,7 @@ pub struct QualityFlags {
     pub used_median_sampling_rate: bool,
     pub no_baseline: bool,
     pub empty_recording: bool,
+    pub time_unit_mismatch: bool,
 }
 
 /// Full quality report; serializes to the same shape as the Python app's
@@ -256,20 +299,18 @@ fn normalized_series(values: &[f64], r0: f64) -> Vec<f64> {
 struct ChannelStats {
     id: String,
     dead: bool,
-    span: f64,
 }
 
 fn channel_stats(values: &[f64], r0: f64) -> ChannelStats {
     let finite: Vec<f64> = values.iter().copied().filter(|v| is_finite(*v)).collect();
     let sd = std(&finite);
     let cv = if r0 > 0.0 { sd / r0 } else { f64::INFINITY };
-    let lo = if finite.is_empty() { f64::NAN } else { finite.iter().copied().fold(f64::INFINITY, f64::min) };
-    let hi = if finite.is_empty() { f64::NAN } else { finite.iter().copied().fold(f64::NEG_INFINITY, f64::max) };
-    let span = if finite.is_empty() { f64::NAN } else { hi - lo };
+    // Raw min-max span is deliberately not retained. Dynamic range now uses a
+    // noise-corrected percentile span computed in `net_span`, because a raw
+    // span is inflated by interference and rewards a noisier recording.
     ChannelStats {
         id: String::new(),
         dead: cv < DEAD_CV_THRESHOLD,
-        span,
     }
 }
 
@@ -301,6 +342,7 @@ pub fn compute_quality(
         used_median_sampling_rate: !rate_declared,
         no_baseline: baseline_source == "none",
         empty_recording: sample_count == 0,
+        time_unit_mismatch: false,
     };
     let mut notes: Vec<String> = Vec::new();
     let mut reasons: BTreeMap<String, String> = BTreeMap::new();
@@ -309,7 +351,33 @@ pub fn compute_quality(
     let gaps: Vec<f64> = time.windows(2).map(|w| w[1] - w[0]).collect();
     let positive_gaps: Vec<f64> = gaps.iter().copied().filter(|g| *g > 0.0).collect();
     let (mut continuity_value, mut continuity_reason) = (100.0_f64, "ok");
-    if sample_count >= 2 {
+    let mut continuity_withheld = false;
+
+    // The time column is assumed to be milliseconds. If a caller supplies
+    // seconds the nominal period below would be wrong by 1000x and continuity
+    // would collapse to 0 with reason "irregular_gaps", which looks identical
+    // to real packet loss. Withhold continuity and say so instead.
+    let observed_median = median(&positive_gaps);
+    let observed_median = if observed_median.is_finite() { Some(observed_median) } else { None };
+    if let (Some(observed), true) = (observed_median, rate_declared) {
+        if sampling_rate_hz > 0.0 {
+            let expected = 1000.0 / sampling_rate_hz;
+            let ratio = observed / expected;
+            if ratio < MIN_TIME_UNIT_RATIO || ratio > MAX_TIME_UNIT_RATIO {
+                continuity_withheld = true;
+                flags.time_unit_mismatch = true;
+                notes.push(format!(
+                    "median gap {:.6} ms is {:.6}x the expected {:.6} ms for {:.6} Hz; the time column is probably in seconds or microseconds rather than milliseconds. Continuity is not reported.",
+                    observed, ratio, expected, sampling_rate_hz
+                ));
+            }
+        }
+    }
+
+    if sample_count >= 2 && continuity_withheld {
+        continuity_value = f64::NAN;
+        continuity_reason = "time_unit_mismatch";
+    } else if sample_count >= 2 {
         let nominal = if rate_declared {
             if sampling_rate_hz > 0.0 {
                 Some(1000.0 / sampling_rate_hz)
@@ -317,8 +385,7 @@ pub fn compute_quality(
                 None
             }
         } else {
-            let m = median(&positive_gaps);
-            let m = if m.is_finite() { Some(m) } else { None };
+            let m = observed_median;
             if m.is_some() {
                 notes.push("samplingRateHz not declared; nominal period taken as the median gap.".to_string());
             }
@@ -378,18 +445,56 @@ pub fn compute_quality(
     let live: Vec<&ChannelStats> = stats.iter().filter(|s| !s.dead).collect();
 
     // --- Dynamic range (spec 7.1.2) ---
+    // Span is a robust 5th-95th percentile range with the channel's noise floor
+    // subtracted, so an interference burst cannot inflate the score. The noise
+    // floor is estimated from sample-to-sample differences rather than the
+    // overall standard deviation, because the overall std includes the
+    // exposure we are trying to measure.
+    let net_span = |s: &ChannelStats| -> f64 {
+        let values: Vec<f64> = channels
+            .iter()
+            .find(|c| c.id == s.id)
+            .map(|c| c.values.iter().copied().filter(|x| x.is_finite()).collect())
+            .unwrap_or_default();
+        // Samples sitting on the converter rail are not measurements of the
+        // chemistry. Including them inflates the span, so a channel driven into
+        // saturation scores a *wider* dynamic range than the same channel read
+        // below the rail -- the same reward-for-worse-data failure the noise
+        // correction fixes. Span is measured over the unclipped samples only;
+        // saturation itself is scored separately by the saturation subscore, so
+        // discarding these samples here loses no signal.
+        let unclipped: Vec<f64> = values
+            .iter()
+            .copied()
+            .filter(|x| !(adc_declared && (*x >= adc_max || *x <= 0.0)))
+            .collect();
+        if unclipped.len() < 5 {
+            return 0.0;
+        }
+        let mut ordered = unclipped.clone();
+        ordered.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let k = ((ordered.len() - 1) as f64 * 0.05) as usize;
+        let k = k.max(1);
+        let robust = ordered[ordered.len() - 1 - k] - ordered[k];
+        let diffs: Vec<f64> = unclipped.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+        let noise = if diffs.is_empty() { 0.0 } else { median(&diffs) / 1.4142135623730951 };
+        (robust - NOISE_SPAN_TOLERANCE * noise).max(0.0)
+    };
     let dynamic_value = if live.is_empty() {
         0.0
     } else {
         let scores: Vec<f64> = live
             .iter()
-            .map(|s| clamp((s.span / adc_max) * (1.0 / MIN_SPAN_FRACTION), 0.0, 1.0))
+            .map(|s| clamp((net_span(s) / adc_max) * (1.0 / MIN_SPAN_FRACTION), 0.0, 1.0))
             .collect();
         100.0 * mean(&scores)
     };
     let dynamic_reason = if dynamic_value < 50.0 { "low_span" } else { "ok" };
     if dynamic_reason == "low_span" {
-        reasons.insert("dynamicRange".to_string(), "channel_span_below_10_percent_of_adc_range".to_string());
+        reasons.insert(
+            "dynamicRange".to_string(),
+            "channel_span_below_10_percent_of_adc_range_after_noise_correction".to_string(),
+        );
     }
 
     // --- Baseline stability (spec 7.1.4) ---
@@ -429,7 +534,17 @@ pub fn compute_quality(
         for s in live {
             let c = channels.iter().find(|c| c.id == s.id).expect("channel present");
             let (r0, _, base_cv) = baseline_for_channel(baseline_source, params.r0_samples, &c.values);
-            let norm: Vec<f64> = normalized_series(&c.values, r0)
+            // A sample pinned at the converter rail carries no amplitude information: the
+            // true peak is unknown and lies somewhere above full scale. Counting
+            // it as the peak would let saturation *raise* the SNR score, so rail
+            // samples are excluded from the normalised series used for peak and
+            // recovery. The saturation subscore reports the clipping itself.
+            let usable: Vec<f64> = if adc_declared {
+                c.values.iter().copied().filter(|v| !(*v >= adc_max || *v <= 0.0)).collect()
+            } else {
+                c.values.clone()
+            };
+            let norm: Vec<f64> = normalized_series(&usable, r0)
                 .into_iter()
                 .filter(|v| is_finite(*v))
                 .collect();
@@ -486,7 +601,19 @@ pub fn compute_quality(
             sum_w += weight_of(k);
         }
     }
-    let total = if sum_w > 0.0 { Some(py_round(weighted / sum_w)) } else { None };
+    let mut total = if sum_w > 0.0 { Some(py_round(weighted / sum_w)) } else { None };
+
+    // Dead channels are excluded from the live-channel means because a constant
+    // channel carries no span, recovery or signal information. That exclusion
+    // would otherwise *raise* the total, so each dead channel costs a fixed
+    // penalty and losing hardware reads as the degradation it is.
+    let mut dead_penalty = 0.0;
+    if let Some(t) = total {
+        if !flags.dead_sensors.is_empty() {
+            dead_penalty = (DEAD_SENSOR_PENALTY * flags.dead_sensors.len() as f64).min(100.0);
+            total = Some(py_round((t - dead_penalty).max(0.0)));
+        }
+    }
     let badge = match total {
         None => "Unknown",
         Some(t) if t >= 90.0 => "Excellent",
@@ -497,6 +624,12 @@ pub fn compute_quality(
 
     if !flags.dead_sensors.is_empty() {
         notes.push(format!("Dead sensors (cv < 0.001): {}", flags.dead_sensors.join(", ")));
+        notes.push(format!(
+            "{} dead channel(s) ({}) reduced the total by {}.",
+            flags.dead_sensors.len(),
+            flags.dead_sensors.join(", "),
+            dead_penalty
+        ));
     }
     if flags.non_finite_samples > 0 {
         notes.push(format!("{} non-finite values skipped.", flags.non_finite_samples));
@@ -578,10 +711,11 @@ mod tests {
         let values: Vec<f64> = (0..10).map(|i| 1000.0 + 10.0 * i as f64).collect();
         let r = compute_quality(&time, &[series("A", values)], &QualityParams::default());
 
-        assert_eq!(r.total, Some(40.0));
+        assert_eq!(r.total, Some(38.0));
         assert_eq!(r.badge, "Poor");
         assert_subscore(&r, "continuity", Some(88.88888888888889), "irregular_gaps");
-        assert_subscore(&r, "dynamicRange", Some(21.97802197802198), "low_span");
+        // Robust 5th-95th span minus 3x the sample-to-sample noise floor.
+        assert_subscore(&r, "dynamicRange", Some(11.913747634774993), "low_span");
         assert_subscore(&r, "saturationFree", Some(100.0), "ok");
         assert_subscore(&r, "baselineStability", Some(0.0), "no_baseline");
         assert_subscore(&r, "signalStrength", None, "no_exposure_signal");
@@ -590,7 +724,7 @@ mod tests {
 
         assert_eq!(
             r.reasons.get("dynamicRange").map(|s| s.as_str()),
-            Some("channel_span_below_10_percent_of_adc_range")
+            Some("channel_span_below_10_percent_of_adc_range_after_noise_correction")
         );
         assert_eq!(
             r.notes,
@@ -617,13 +751,16 @@ mod tests {
         };
         let r = compute_quality(&good_time(), &[series("A", values)], &params);
 
-        assert_eq!(r.total, Some(45.0));
+        // A dead channel costs DEAD_SENSOR_PENALTY off the total, so losing
+        // hardware reads as a degradation rather than an improvement.
+        assert_eq!(r.total, Some(32.0));
         assert_eq!(r.badge, "Poor");
         assert_eq!(r.flags.dead_sensors, vec!["A"]);
         assert_subscore(&r, "baselineStability", Some(50.0), "auto_r0");
         assert_subscore(&r, "signalStrength", Some(0.0), "ok");
         assert_subscore(&r, "recoveryCompleteness", Some(0.0), "ok");
         assert_eq!(r.notes[0], "Dead sensors (cv < 0.001): A");
+        assert!(r.notes.iter().any(|n| n.contains("reduced the total by 12.5")));
     }
 
     #[test]
@@ -646,9 +783,11 @@ mod tests {
         };
         let r = compute_quality(&good_time(), &[series("A", values)], &params);
 
-        assert_eq!(r.total, Some(55.0));
+        assert_eq!(r.total, Some(54.0));
         assert_eq!(r.badge, "Fair");
-        assert_subscore(&r, "dynamicRange", Some(66.66666666666666), "ok");
+        // Noise-corrected: a perfectly clean linear ramp now scores 59.5 rather
+        // than 66.7, because the noise allowance is subtracted from span.
+        assert_subscore(&r, "dynamicRange", Some(59.52859547920908), "ok");
         assert_subscore(&r, "baselineStability", Some(44.92246469412503), "ok");
         assert_subscore(&r, "signalStrength", Some(17.291640722335746), "ok");
         assert_subscore(&r, "recoveryCompleteness", Some(4.666666666666741), "ok");
@@ -717,5 +856,243 @@ mod tests {
             (a, b) => assert_eq!(a, b, "subscore {} value mismatch", key),
         }
         assert_eq!(sub.reason, reason, "subscore {} reason mismatch", key);
+    }
+    // --- Regressions for the fixed defects found in the calibration study ---
+    // Mirrors opensmell/tests/test_quality.py. See
+    // opensmell/docs/quality-weight-calibration.md.
+
+    #[test]
+    fn time_column_in_seconds_is_flagged_not_scored_as_packet_loss() {
+        let values: Vec<f64> = (0..N).map(|i| 1000.0 + i as f64).collect();
+        let time: Vec<f64> = (0..N).map(|i| i as f64 * 0.1).collect(); // seconds
+        let params = QualityParams {
+            sampling_rate_hz: Some(10.0),
+            ..Default::default()
+        };
+        let r = compute_quality(&time, &[series("A", values)], &params);
+
+        assert!(r.flags.time_unit_mismatch);
+        assert_subscore(&r, "continuity", None, "time_unit_mismatch");
+        assert!(r.notes.iter().any(|n| n.contains("milliseconds")));
+    }
+
+    #[test]
+    fn millisecond_time_column_is_not_flagged() {
+        let values: Vec<f64> = (0..N).map(|i| 1000.0 + i as f64).collect();
+        let params = QualityParams {
+            sampling_rate_hz: Some(10.0),
+            ..Default::default()
+        };
+        let r = compute_quality(&good_time(), &[series("A", values)], &params);
+
+        assert!(!r.flags.time_unit_mismatch);
+        assert_subscore(&r, "continuity", Some(100.0), "ok");
+    }
+
+    #[test]
+    fn gap_jitter_within_tolerance_is_not_a_unit_mismatch() {
+        let values: Vec<f64> = (0..N).map(|i| 1000.0 + i as f64).collect();
+        // 10 Hz nominal is 100 ms; 1.5x jitter is well inside the plausibility
+        // band, so this is jitter rather than a bad time unit.
+        let time: Vec<f64> = (0..N)
+            .map(|i| i as f64 * 100.0 + if i % 37 == 0 { 30.0 } else { 0.0 })
+            .collect();
+        let params = QualityParams {
+            sampling_rate_hz: Some(10.0),
+            ..Default::default()
+        };
+        let r = compute_quality(&time, &[series("A", values)], &params);
+
+        assert!(!r.flags.time_unit_mismatch);
+        assert!(r.subscores.get("continuity").and_then(|s| s.value).is_some());
+    }
+
+    #[test]
+    fn noise_burst_does_not_raise_dynamic_range() {
+        let clean: Vec<f64> = (0..N).map(|i| 1000.0 + (i as f64 / 60.0) * 400.0).collect();
+        let noisy: Vec<f64> = (0..N)
+            .map(|i| 1000.0 + (i as f64 / 60.0) * 400.0 + if (300..360).contains(&i) { 60.0 } else { 0.0 })
+            .collect();
+        let mk = |values: Vec<f64>| {
+            compute_quality(
+                &good_time(),
+                &[series("A", values)],
+                &QualityParams {
+                    adc_max: Some(4095.0),
+                    sampling_rate_hz: Some(10.0),
+                    role: "exposure".into(),
+                    baseline_source: "explicit".into(),
+                    ..Default::default()
+                },
+            )
+        };
+        let q_clean = mk(clean);
+        let q_noisy = mk(noisy);
+
+        let d_clean = q_clean.subscores.get("dynamicRange").unwrap().value.unwrap();
+        let d_noisy = q_noisy.subscores.get("dynamicRange").unwrap().value.unwrap();
+        assert!(
+            d_noisy <= d_clean,
+            "interference must not raise dynamic range: {d_noisy} > {d_clean}"
+        );
+    }
+
+    #[test]
+    fn saturation_does_not_raise_dynamic_range() {
+        // A pulse that rises and returns to baseline, so the recovery subscore
+        // is healthy in both conditions and cannot confound the comparison.
+        // Peak stays well below the 4095 rail in the control.
+        let in_range = |i: usize| {
+            let phase = if (250..350).contains(&i) { 1.0 } else { 0.0 };
+            1000.0 + phase * 800.0
+        };
+        let clean: Vec<f64> = (0..N).map(in_range).collect();
+        let clipped: Vec<f64> = (0..N)
+            .map(|i| if (280..320).contains(&i) { 4095.0 } else { in_range(i) })
+            .collect();
+        assert!(clean.iter().all(|v| *v < 4095.0), "control must not clip");
+        let mk = |values: Vec<f64>| {
+            compute_quality(
+                &good_time(),
+                &[series("A", values)],
+                &QualityParams {
+                    adc_max: Some(4095.0),
+                    sampling_rate_hz: Some(10.0),
+                    role: "exposure".into(),
+                    baseline_source: "explicit".into(),
+                    ..Default::default()
+                },
+            )
+        };
+        let q_clean = mk(clean);
+        let q_clipped = mk(clipped);
+
+        let d_clean = q_clean.subscores.get("dynamicRange").unwrap().value.unwrap();
+        let d_clipped = q_clipped.subscores.get("dynamicRange").unwrap().value.unwrap();
+        assert!(
+            d_clipped <= d_clean,
+            "clipping to the rail must not widen the span: {d_clipped} > {d_clean}"
+        );
+        let s_clean = q_clean.subscores.get("saturationFree").unwrap().value.unwrap();
+        let s_clipped = q_clipped.subscores.get("saturationFree").unwrap().value.unwrap();
+        assert!(s_clipped < s_clean, "clipping must be visible in saturationFree");
+        assert!(
+            q_clipped.total.unwrap() < q_clean.total.unwrap(),
+            "a saturated recording must not outscore a clean one: {} vs {}",
+            q_clipped.total.unwrap(),
+            q_clean.total.unwrap()
+        );
+    }
+
+    #[test]
+    fn real_exposure_still_earns_dynamic_range() {
+        let values: Vec<f64> = (0..N).map(|i| 1000.0 + (i as f64 / 60.0) * 400.0).collect();
+        let r = compute_quality(
+            &good_time(),
+            &[series("A", values)],
+            &QualityParams {
+                adc_max: Some(4095.0),
+                sampling_rate_hz: Some(10.0),
+                role: "exposure".into(),
+                baseline_source: "explicit".into(),
+                ..Default::default()
+            },
+        );
+
+        let d = r.subscores.get("dynamicRange").unwrap().value.unwrap();
+        assert!(d > 0.0, "the noise correction must not flatten a real ramp to zero");
+        assert_eq!(r.subscores.get("dynamicRange").unwrap().reason, "ok");
+    }
+
+    #[test]
+    fn dead_sensor_penalty_scales_with_channel_count() {
+        let live: Vec<f64> = (0..N).map(|i| 1000.0 + (i as f64 / 60.0) * 400.0).collect();
+        let params = QualityParams {
+            adc_max: Some(4095.0),
+            sampling_rate_hz: Some(10.0),
+            role: "exposure".into(),
+            baseline_source: "explicit".into(),
+            ..Default::default()
+        };
+        let both_live = compute_quality(
+            &good_time(),
+            &[series("A", live.clone()), series("B", live.clone())],
+            &params,
+        );
+        let one_dead = compute_quality(
+            &good_time(),
+            &[series("A", live.clone()), series("B", vec![1000.0; N])],
+            &params,
+        );
+        let two_dead = compute_quality(&good_time(), &[series("A", vec![1000.0; N]), series("B", vec![1000.0; N])], &params);
+
+        assert!(two_dead.total.unwrap() < one_dead.total.unwrap());
+        assert!(one_dead.total.unwrap() < both_live.total.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod parity {
+    //! Numeric parity spot-checks against the Python implementation.
+    //! Expected values were produced by opensmell/tests/test_quality.py
+    //! fixtures on the same inputs.
+
+    use super::*;
+
+    /// Note: this ramp reaches 5000 against a declared `adc_max` of 4095, so
+    /// roughly the top fifth of it sits on the converter rail. That is
+    /// deliberate -- it exercises the clipping path on every parity check --
+    /// but it means these totals are lower than a clean in-range recording's.
+    fn ramp() -> Vec<f64> {
+        (0..601).map(|i| 1000.0 + (i as f64 / 60.0) * 400.0).collect()
+    }
+
+    fn params() -> QualityParams {
+        QualityParams {
+            adc_max: Some(4095.0),
+            sampling_rate_hz: Some(10.0),
+            role: "exposure".into(),
+            baseline_source: "explicit".into(),
+            r0_samples: Some(30),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parity_dynamic_range_clean_and_noisy() {
+        let noisy: Vec<f64> = (0..601)
+            .map(|i| 1000.0 + (i as f64 / 60.0) * 400.0 + if (300..360).contains(&i) { 60.0 } else { 0.0 })
+            .collect();
+        let clean = compute_quality(&good_time_for_parity(), &[ChannelSeries::new("A", ramp())], &params());
+        let dirty = compute_quality(&good_time_for_parity(), &[ChannelSeries::new("A", noisy)], &params());
+
+        // Python: clean=100.0000 noisy=100.0000
+        assert_eq!(clean.subscores.get("dynamicRange").unwrap().value, Some(100.0));
+        assert_eq!(dirty.subscores.get("dynamicRange").unwrap().value, Some(100.0));
+    }
+
+    #[test]
+    fn parity_dead_sensor_penalty() {
+        let t = good_time_for_parity();
+        let both_live = compute_quality(&t, &[ChannelSeries::new("A", ramp()), ChannelSeries::new("B", ramp())], &params());
+        let one_dead = compute_quality(&t, &[ChannelSeries::new("A", ramp()), ChannelSeries::new("B", vec![1000.0; 601])], &params());
+        let two_dead = compute_quality(&t, &[ChannelSeries::new("A", vec![1000.0; 601]), ChannelSeries::new("B", vec![1000.0; 601])], &params());
+
+        // Python: live=53 one=42 two=30
+        assert_eq!(both_live.total, Some(53.0));
+        assert_eq!(one_dead.total, Some(42.0));
+        assert_eq!(two_dead.total, Some(30.0));
+    }
+
+    #[test]
+    fn parity_jitter_continuity() {
+        let t: Vec<f64> = (0..601).map(|i| i as f64 * 100.0 + if i % 37 == 0 { 30.0 } else { 0.0 }).collect();
+        let r = compute_quality(&t, &[ChannelSeries::new("A", ramp())], &params());
+        // Python: 94.5
+        assert_eq!(r.subscores.get("continuity").unwrap().value, Some(94.5));
+    }
+
+    fn good_time_for_parity() -> Vec<f64> {
+        (0..601).map(|i| i as f64 * 100.0).collect()
     }
 }
