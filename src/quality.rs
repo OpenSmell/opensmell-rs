@@ -57,7 +57,10 @@ use serde::Serialize;
 
 // Constants (shared with the web lib: `opensmell/types.py`).
 pub const DEFAULT_ADC_MAX: f64 = 4095.0;
-pub const DEFAULT_R0_SAMPLES: usize = 15;
+/// `R0_WINDOW_DEFAULT` means "no declared window": derive it from the channel
+/// length via `crate::r0_window_samples`. See "The R0 window contract" in
+/// `electronic-nose/SAMPLING_CONTRACT.md`.
+pub const DEFAULT_R0_SAMPLES: usize = crate::R0_WINDOW_DEFAULT;
 pub const DEAD_CV_THRESHOLD: f64 = 0.001;
 pub const NOISE_CV_LIMIT: f64 = 0.05;
 pub const SNR_TARGET: f64 = 10.0;
@@ -273,6 +276,9 @@ fn r0_from_samples(values: &[f64], n: usize) -> f64 {
 }
 
 /// Returns `(r0, window_values, cv)` for a channel, mirroring `baseline_for_channel`.
+///
+/// `r0_samples` is the manifest-declared window. `None` (or `R0_WINDOW_DEFAULT`)
+/// derives it from the channel length via `crate::r0_window_samples`.
 fn baseline_for_channel(
     source: &str,
     r0_samples: Option<usize>,
@@ -283,7 +289,8 @@ fn baseline_for_channel(
         let cv = if r0 > 0.0 { std(values) / r0 } else { f64::INFINITY };
         return (r0, values.to_vec(), cv);
     }
-    let n = r0_samples.unwrap_or(DEFAULT_R0_SAMPLES);
+    let declared = r0_samples.unwrap_or(DEFAULT_R0_SAMPLES);
+    let n = crate::r0_window_samples(values.len(), declared);
     let valid: Vec<f64> = values
         .iter()
         .take(n)

@@ -35,9 +35,13 @@ pub const WINDOW_SIZE_MAX: usize = 500;
 /// Default training window size (matches reference `window_size=100`).
 pub const DEFAULT_WINDOW_SIZE: usize = 100;
 
-/// Leading samples used to estimate R0 per window (matches the reference
-/// `r0_samples=15` default used by `extract_all_framework_features`).
-pub const DEFAULT_R0_SAMPLES: usize = 15;
+/// Leading samples used to estimate R0 per window when nothing is declared:
+/// `R0_WINDOW_DEFAULT` means "derive from the window length" via
+/// `crate::r0_window_samples` -- a floored, capped 15% of the recording, which
+/// spans the same *seconds* at any cadence. A fixed 15 samples did not: it is
+/// 1.5 s at 10 Hz and 15 s at 1 Hz. See "The R0 window contract" in
+/// `electronic-nose/SAMPLING_CONTRACT.md`.
+pub const DEFAULT_R0_SAMPLES: usize = crate::R0_WINDOW_DEFAULT;
 
 /// Regularization strength (matches `C=1.0`).
 pub const DEFAULT_C: f64 = 1.0;
@@ -165,6 +169,9 @@ fn solve_linear(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
 /// reference's per-sample default (there the formula is undefined).
 ///
 /// Dead/constant channels produce five zeros, matching the reference.
+///
+/// `r0_samples` is the declared baseline window; `R0_WINDOW_DEFAULT` derives it
+/// from the window length via `crate::r0_window_samples`.
 pub fn paradigm_window_features(window: &[Vec<f64>], r0_samples: usize, sr: f64) -> Vec<f64> {
     if window.is_empty() {
         return vec![];
@@ -174,7 +181,7 @@ pub fn paradigm_window_features(window: &[Vec<f64>], r0_samples: usize, sr: f64)
         return vec![];
     }
     let fs = if sr.is_finite() { sr.abs() } else { 1e-9 }.max(1e-9);
-    let r0 = r0_samples.max(1);
+    let r0 = crate::r0_window_samples(window.len(), r0_samples);
     let mut feats = Vec::with_capacity(n_channels * 5);
 
     for c in 0..n_channels {

@@ -47,6 +47,11 @@ pub enum OsmMessage {
     Info { device_id: String, firmware_version: String, n_sensors: usize },
     /// Calibration request: CAL,<channel>,<r0_value>
     Calibration { channel: usize, r0_value: f64 },
+    /// Phase boundary: EVENT,<label>,<sample_index>[,t_ms=<MS>]
+    /// `sample_index` is the index of the first sample of the new phase, so the
+    /// next `Data` line is that sample. `t_ms` is the host's monotonic clock at
+    /// injection, when the sender supplied one.
+    Event { label: String, sample_index: i64, t_ms: Option<i64> },
     /// Error message: ERR,<error_code>,<message>
     Error { code: i32, message: String },
     /// Heartbeat: PING
@@ -59,6 +64,36 @@ pub enum OsmMessage {
     /// Unknown line.
     Unknown(String),
 }
+
+/// Conventional `EVENT` labels. Free-form on the wire — an unrecognised label is
+/// a legal phase name — but these are what the recording and submission layers
+/// recognise.
+pub const KNOWN_PHASE_LABELS: [&str; 6] = [
+    "baseline", "exposure", "exposure_a", "exposure_b", "gap", "recovery",
+];
+
+/// Build the line a host sends to mark a phase boundary.
+///
+/// `sample_index` is the index of the first sample of the new phase; pass
+/// [`SAMPLE_INDEX_DEVICE_ASSIGNED`] to have the device substitute its own
+/// next-sample index, which is what a host that is not counting should do.
+/// `t_ms` is the caller's monotonic clock at injection and is optional.
+///
+/// The result carries no trailing newline — the caller appends one, as with
+/// `parse_line` taking a line without one. The label must not contain a comma:
+/// the wire is comma-delimited, and a comma inside the label would move every
+/// following field. A malformed line is rejected by the device with `ERR,8`
+/// rather than silently reinterpreted.
+pub fn format_event(label: &str, sample_index: i64, t_ms: Option<i64>) -> String {
+    let mut line = format!("EVENT,{},{}", label, sample_index);
+    if let Some(t) = t_ms {
+        line.push_str(&format!(",t_ms={}", t));
+    }
+    line
+}
+
+/// `sample_index` value asking the device to assign the boundary itself.
+pub const SAMPLE_INDEX_DEVICE_ASSIGNED: i64 = -1;
 
 /// OSM protocol parser.
 /// Works with any MCU (ESP32, Arduino, STM32, RPi) that sends CSV-like data.
@@ -95,6 +130,7 @@ impl OsmProtocol {
             "ENV" => self.parse_env(&parts[1..]),
             "INFO" => self.parse_info(&parts[1..]),
             "CAL" => self.parse_calibration(&parts[1..]),
+            "EVENT" => self.parse_event(&parts[1..]),
             "ERR" => self.parse_error(&parts[1..]),
             "PING" => Ok(OsmMessage::Ping),
             _ => Ok(OsmMessage::Unknown(line.to_string())),
@@ -172,6 +208,31 @@ impl OsmProtocol {
         })
     }
 
+    /// EVENT,<label>,<sample_index>[,t_ms=<MS>] — a phase boundary. `t_ms` is
+    /// optional and may appear anywhere after the index; anything unparseable in
+    /// it is dropped rather than failing the boundary, since the boundary itself
+    /// is the part a reader cannot recover on its own.
+    fn parse_event(&self, parts: &[&str]) -> Result<OsmMessage> {
+        if parts.len() < 2 {
+            return Err(OpenSmellError::FeatureExtraction("EVENT message too short".to_string()));
+        }
+        let label = parts[0].trim();
+        if label.is_empty() {
+            return Err(OpenSmellError::FeatureExtraction(
+                "EVENT message has an empty label".to_string(),
+            ));
+        }
+        let sample_index = parts[1].trim().parse().unwrap_or(SAMPLE_INDEX_DEVICE_ASSIGNED);
+        let t_ms = parts[2..].iter().find_map(|p| {
+            p.trim().strip_prefix("t_ms=").and_then(|v| v.trim().parse().ok())
+        });
+        Ok(OsmMessage::Event {
+            label: label.to_string(),
+            sample_index,
+            t_ms,
+        })
+    }
+
     fn parse_error(&self, parts: &[&str]) -> Result<OsmMessage> {
         if parts.len() < 2 {
             return Ok(OsmMessage::Error { code: -1, message: "Unknown error".to_string() });
@@ -191,7 +252,8 @@ impl OsmProtocol {
 /// - runs a multi-client TCP server speaking the OSM protocol,
 /// - streams `OSM` readings at 10 Hz over serial and to all clients,
 /// - responds to `PING` (with `PONG`) and `CAL` (re-baseline),
-/// - sends `INFO` on client connect,
+/// - sends `INFO` with the declared cadence on every client connect,
+/// - accepts `EVENT` phase boundaries and re-announces them on every output,
 /// - collects a baseline (`r0` per channel) at boot.
 pub fn generate_arduino_sketch(
     sensor_pins: &[u8],
@@ -214,7 +276,7 @@ pub fn generate_arduino_sketch(
 #include <mDNS.h>
 #include <string.h>
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 #define OSM_SERVICE "_osmograph"
 #define OSM_TCP_PORT 8080
 #define SAMPLE_INTERVAL_MS 100          // 10 Hz per channel
@@ -241,6 +303,19 @@ float r0[N_SENSORS] = {{0}};
 bool calibrated = false;
 uint32_t lastSampleMs = 0;
 
+// Phase boundaries. A boundary is announced on every output immediately before
+// the first OSM line of the new phase, so a reader knows which sample the label
+// belongs to without counting. `pendingEvent` holds the boundary a host has
+// injected but that has not reached the stream yet; SAMPLE_INDEX_ASSIGN asks the
+// device to use its own counter, which is what a host that is not counting sends.
+#define SAMPLE_INDEX_ASSIGN (-1L)
+#define EVENT_LABEL_MAX 32
+bool pendingEvent = false;
+char pendingLabel[EVENT_LABEL_MAX];
+long pendingIndex = SAMPLE_INDEX_ASSIGN;
+long pendingTMs = -1;
+long sampleIndex = 0;
+
 void logLine(const String& s) {{
     Serial.println(s);
 }}
@@ -253,6 +328,13 @@ String deviceId() {{
     return String(id);
 }}
 
+String infoLine() {{
+    // interval_ms is not optional in practice: a host that has to assume a rate
+    // rescales every count-based temporal feature by the ratio of the two.
+    return "INFO," + deviceId() + "," + String(FW_VERSION) + "," +
+           String(N_SENSORS) + ",interval_ms=" + String(SAMPLE_INTERVAL_MS);
+}}
+
 float readVoltage(int pin) {{
     return (analogRead(pin) / (float)4095) * 3.3f;
 }}
@@ -263,6 +345,36 @@ void sendToClients(const String& line) {{
             clients[i].println(line);
         }}
     }}
+}}
+
+void announceToAll(const String& line) {{
+    logLine(line);
+    sendToClients(line);
+}}
+
+// Queue a phase boundary for the next emitted sample. `index` may be
+// SAMPLE_INDEX_ASSIGN, in which case the device's own counter is used.
+void queueEvent(const String& label, long index, long tMs) {{
+    if (label.length() == 0 || label.length() >= EVENT_LABEL_MAX) {{
+        logLine("ERR,8,EVENT label must be 1.." + String(EVENT_LABEL_MAX - 1) + " characters");
+        return;
+    }}
+    strncpy(pendingLabel, label.c_str(), EVENT_LABEL_MAX - 1);
+    pendingLabel[EVENT_LABEL_MAX - 1] = '\0';
+    pendingIndex = (index == SAMPLE_INDEX_ASSIGN) ? sampleIndex : index;
+    pendingTMs = tMs;
+    pendingEvent = true;
+}}
+
+// Emit the queued boundary, if any, immediately before the sample it annotates.
+void flushPendingEvent() {{
+    if (!pendingEvent) return;
+    String line = "EVENT," + String(pendingLabel) + "," + String(pendingIndex);
+    if (pendingTMs >= 0) {{
+        line += ",t_ms=" + String(pendingTMs);
+    }}
+    announceToAll(line);
+    pendingEvent = false;
 }}
 
 void collectBaseline() {{
@@ -331,7 +443,7 @@ void setup() {{
     logLine("Device " + deviceId() + " fw " + String(FW_VERSION) + " channels " + String(N_SENSORS));
     // Announce the channel layout on Serial too, so the desktop auto-detects
     // the stream width the instant the board powers on (no manual rig picker).
-    logLine("INFO," + deviceId() + "," + String(FW_VERSION) + "," + String(N_SENSORS));
+    logLine(infoLine());
 
     logLine("Collecting baseline...");
     collectBaseline();
@@ -352,6 +464,31 @@ void serviceClients() {{
             }} else if (cmd.startsWith("CAL")) {{
                 collectBaseline();
                 clients[i].println("CAL,OK");
+            }} else if (cmd.startsWith("EVENT,")) {{
+                // EVENT,<label>,<sample_index>[,t_ms=<MS>]. The label is quoted
+                // rather than split blindly: a comma in it would otherwise shift
+                // every following field, which is exactly what ERR,8 is for.
+                int c1 = cmd.indexOf(',');
+                int c2 = cmd.indexOf(',', c1 + 1);
+                if (c1 < 0 || c2 < 0) {{
+                    clients[i].println("ERR,8,EVENT needs <label> and <sample_index>");
+                }} else {{
+                    String label = cmd.substring(c1 + 1, c2);
+                    String rest = cmd.substring(c2 + 1);
+                    long index = SAMPLE_INDEX_ASSIGN;
+                    long tMs = -1;
+                    int tAt = rest.indexOf("t_ms=");
+                    if (tAt >= 0) {{
+                        tMs = strtol(rest.substring(tAt + 5).c_str(), NULL, 10);
+                        rest = rest.substring(0, tAt);
+                    }}
+                    if (rest.length() == 0) {{
+                        clients[i].println("ERR,8,EVENT needs a sample_index");
+                    }} else {{
+                        index = strtol(rest.c_str(), NULL, 10);
+                        queueEvent(label, index, tMs);
+                    }}
+                }}
             }}
         }}
     }}
@@ -364,7 +501,9 @@ void loop() {{
             if (!clients[i]) {{
                 clients[i] = newClient;
                 logLine("Client connected (slot " + String(i) + ")");
-                clients[i].println("INFO," + deviceId() + "," + String(FW_VERSION) + "," + String(N_SENSORS));
+                // Every client gets the cadence, not just the first one: a client
+                // that connects to a running stream has no other way to learn it.
+                clients[i].println(infoLine());
                 break;
             }}
         }}
@@ -375,6 +514,7 @@ void loop() {{
     uint32_t now = millis();
     if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {{
         lastSampleMs = now;
+        flushPendingEvent();
         String line = "OSM";
         for (int i = 0; i < N_SENSORS; i++) {{
             line += ",";
@@ -382,6 +522,7 @@ void loop() {{
         }}
         Serial.println(line);
         sendToClients(line);
+        sampleIndex++;
     }}
 
     yield();
@@ -551,6 +692,120 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_event_phase_boundary() {
+        let protocol = OsmProtocol::new(0);
+        match protocol.parse_line("EVENT,exposure,600", 0.0).unwrap() {
+            OsmMessage::Event { label, sample_index, t_ms } => {
+                assert_eq!(label, "exposure");
+                assert_eq!(sample_index, 600);
+                assert_eq!(t_ms, None);
+            }
+            _ => panic!("Expected Event message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_carries_optional_host_clock() {
+        let protocol = OsmProtocol::new(0);
+        match protocol.parse_line("EVENT,recovery,720,t_ms=361200", 0.0).unwrap() {
+            OsmMessage::Event { label, sample_index, t_ms } => {
+                assert_eq!(label, "recovery");
+                assert_eq!(sample_index, 720);
+                assert_eq!(t_ms, Some(361200));
+            }
+            _ => panic!("Expected Event message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_device_assigned_index_survives() {
+        let protocol = OsmProtocol::new(0);
+        match protocol
+            .parse_line(&format_event("baseline", SAMPLE_INDEX_DEVICE_ASSIGNED, None), 0.0)
+            .unwrap()
+        {
+            OsmMessage::Event { label, sample_index, t_ms } => {
+                assert_eq!(label, "baseline");
+                assert_eq!(sample_index, SAMPLE_INDEX_DEVICE_ASSIGNED);
+                assert_eq!(t_ms, None);
+            }
+            _ => panic!("Expected Event message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_too_short_or_unlabelled_is_an_error() {
+        let protocol = OsmProtocol::new(0);
+        assert!(protocol.parse_line("EVENT", 0.0).is_err());
+        assert!(protocol.parse_line("EVENT,exposure", 0.0).is_err());
+        assert!(protocol.parse_line("EVENT,,600", 0.0).is_err());
+    }
+
+    #[test]
+    fn test_event_labels_match_the_data_commons_vocabulary() {
+        // Every conventional label must parse and survive a round trip, since the
+        // validator treats an unknown label as worth reporting.
+        for label in KNOWN_PHASE_LABELS {
+            match protocol_event(label) {
+                OsmMessage::Event { label: parsed, .. } => assert_eq!(parsed, label),
+                _ => panic!("Expected Event message"),
+            }
+        }
+    }
+
+    fn protocol_event(label: &str) -> OsmMessage {
+        let protocol = OsmProtocol::new(0);
+        protocol
+            .parse_line(&format_event(label, SAMPLE_INDEX_DEVICE_ASSIGNED, None), 0.0)
+            .expect("conventional label parses")
+    }
+
+    #[test]
+    fn test_format_event_shapes() {
+        assert_eq!(format_event("baseline", -1, None), "EVENT,baseline,-1");
+        assert_eq!(format_event("exposure", 600, None), "EVENT,exposure,600");
+        assert_eq!(
+            format_event("recovery", 720, Some(361200)),
+            "EVENT,recovery,720,t_ms=361200"
+        );
+    }
+
+    #[test]
+    fn test_event_round_trips_through_the_parser() {
+        let protocol = OsmProtocol::new(0);
+        for (label, index, t_ms) in [
+            ("baseline", 0i64, None),
+            ("exposure", 600, Some(300_000i64)),
+            ("gap", 720, Some(360_000)),
+            ("recovery", 960, None),
+        ] {
+            let line = format_event(label, index, t_ms);
+            match protocol.parse_line(&line, 0.0).unwrap() {
+                OsmMessage::Event { label: l, sample_index: i, t_ms: t } => {
+                    assert_eq!((l.as_str(), i, t), (label, index, t_ms));
+                }
+                _ => panic!("Expected Event message"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_unknown_message_type_is_skipped_not_fatal() {
+        // The backward-compatibility contract for EVENT: an older reader meets it
+        // as an unknown line and carries on.
+        let protocol = OsmProtocol::new(3);
+        match protocol.parse_line("EVENT,exposure,600", 0.0).unwrap() {
+            OsmMessage::Event { .. } => {}
+            other => panic!("this build understands EVENT, got {:?}", other),
+        }
+        // A type this build has never heard of is Unknown, not an error.
+        match protocol.parse_line("FUTURE,1,2,3", 0.0).unwrap() {
+            OsmMessage::Unknown(raw) => assert_eq!(raw, "FUTURE,1,2,3"),
+            other => panic!("Expected Unknown, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_generated_sketch_has_mdns_and_protocol() {
         let sketch = generate_arduino_sketch(&[32, 33, 34, 35, 36, 39], "TestNet", "secret");
         assert!(sketch.contains("MDNS.addService(\"_osmograph\", \"tcp\", OSM_TCP_PORT)"));
@@ -561,6 +816,33 @@ mod tests {
         assert!(sketch.contains("clients[i].println(\"PONG\")"));
         assert!(sketch.contains("SAMPLE_INTERVAL_MS 100"));
         assert!(sketch.contains("const int N_SENSORS = 6;"));
+    }
+
+    #[test]
+    fn test_generated_sketch_declares_cadence_to_every_client() {
+        // A client that connects to an already-running stream has no other way to
+        // learn the rate, and guessing it rescales every temporal feature.
+        let sketch = generate_arduino_sketch(&[32, 33], "", "");
+        assert!(sketch.contains("String infoLine()"));
+        assert!(sketch.contains("interval_ms=\" + String(SAMPLE_INTERVAL_MS)"));
+        assert!(sketch.contains("clients[i].println(infoLine());"));
+        assert!(sketch.contains("logLine(infoLine());"));
+    }
+
+    #[test]
+    fn test_generated_sketch_handles_phase_events() {
+        let sketch = generate_arduino_sketch(&[32, 33], "", "");
+        assert!(sketch.contains("cmd.startsWith(\"EVENT,\")"));
+        assert!(sketch.contains("queueEvent(label, index, tMs);"));
+        assert!(sketch.contains("flushPendingEvent();"));
+        // The boundary must reach the sample it annotates, so it is flushed
+        // before the OSM line and not after it.
+        let flush = sketch.find("flushPendingEvent();").expect("flush in loop");
+        let osm = sketch.find("String line = \"OSM\";").expect("OSM line in loop");
+        assert!(flush < osm);
+        assert!(sketch.contains("announceToAll(line);"));
+        assert!(sketch.contains("sampleIndex++;"));
+        assert!(sketch.contains("ERR,8,EVENT needs <label> and <sample_index>"));
     }
 
     #[test]

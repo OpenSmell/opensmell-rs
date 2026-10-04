@@ -253,19 +253,21 @@ fn argmax_abs(x: &[f64]) -> usize {
     best
 }
 
-/// Reference `_r0_from_contract`: explicit R0, else median of first `r0_samples`
-/// finite samples; guards fall back to mean of positives, then 1.0.
+/// Reference `_r0_from_contract`: explicit R0, else median of the first
+/// `r0_samples` finite samples; guards fall back to mean of positives, then 1.0.
+///
+/// `r0_samples` is the declared baseline window and is used verbatim.
+/// `R0_WINDOW_DEFAULT` means nothing was declared, so the window is
+/// `crate::r0_window_samples(finite.len(), R0_WINDOW_DEFAULT)` -- a floored, capped
+/// 15% of the recording, which spans the same *seconds* at any cadence. See "The
+/// R0 window contract" in `electronic-nose/SAMPLING_CONTRACT.md`.
 fn r0_from_contract(series: &[f64], r0_samples: usize, r0: Option<f64>) -> f64 {
     let finite: Vec<f64> = series.iter().copied().filter(|v| v.is_finite()).collect();
     let mut r0v: f64 = match r0 {
         Some(v) => v,
         None => {
-            if r0_samples > 0 {
-                let lim = r0_samples.min(finite.len());
-                median(&finite[..lim])
-            } else {
-                median(&finite)
-            }
+            let lim = crate::r0_window_samples(finite.len(), r0_samples);
+            median(&finite[..lim.min(finite.len())])
         }
     };
     if !r0v.is_finite() || r0v <= 0.0 {
@@ -324,6 +326,7 @@ fn first_cross(series: &[f64], thresh: f64, dir_: i64) -> Option<usize> {
 }
 
 fn compute_channel_device_agnostic(series: &[f64], r0_samples: usize, sr: f64, r0: Option<f64>) -> DeviceAgnostic {
+    let r0_samples = crate::r0_window_samples(series.len(), r0_samples);
     if series.len() < r0_samples + 2 {
         return DeviceAgnostic::empty();
     }
@@ -427,7 +430,7 @@ fn compute_channel_device_agnostic(series: &[f64], r0_samples: usize, sr: f64, r
 fn compute_channel_absolute(series: &[f64], r0: Option<f64>, a_const: f64, b_const: f64) -> (f64, f64, f64, f64) {
     let r0v = match r0 {
         Some(v) if v.is_finite() && v > 0.0 => v,
-        _ => r0_from_contract(series, 15, None),
+        _ => r0_from_contract(series, crate::R0_WINDOW_DEFAULT, None),
     };
     let raw_resistance = if series.len() >= 10 {
         let start = series.len() - 10;
@@ -494,6 +497,9 @@ fn compute_channel_temporal(series: &[f64], sr: f64) -> (f64, f64, f64, f64) {
 }
 
 fn compute_channel_health(series: &[f64], r0_samples: usize, r0: Option<f64>) -> (f64, f64, f64, f64) {
+    // Resolve the window once, from the row count, so R0 and noise_floor below
+    // are measured over the same span.
+    let r0_samples = crate::r0_window_samples(series.len(), r0_samples);
     if series.len() < r0_samples + 5 {
         return (0.0, 0.0, 0.0, 0.0);
     }
@@ -553,6 +559,7 @@ fn compute_channel_hardware(series: &[f64]) -> (f64, f64, f64) {
 }
 
 fn compute_saturation_index(series: &[f64], r0_samples: usize, r0: Option<f64>) -> f64 {
+    let r0_samples = crate::r0_window_samples(series.len(), r0_samples);
     if series.len() < r0_samples + 5 {
         return 0.0;
     }
@@ -962,6 +969,12 @@ pub fn framework_feature_len(n_channels: usize) -> usize {
 /// Compute the full framework feature vector in the deterministic sorted-name
 /// order used by the reference runtime (see module docs). Returns `None` if the
 /// window is empty or channel count is zero.
+///
+/// `r0_samples` is a declared baseline window shared by every per-channel block,
+/// or `R0_WINDOW_DEFAULT` for the cadence-independent contract default
+/// `crate::r0_window_samples` -- a floored, capped 15% of the recording. A
+/// declared window wins verbatim; see "The R0 window contract" in
+/// `electronic-nose/SAMPLING_CONTRACT.md`.
 pub fn framework_window_features(window: &[Vec<f64>], r0_samples: usize, sr: f64) -> Option<Vec<f64>> {
     if window.is_empty() {
         return None;

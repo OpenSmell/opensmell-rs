@@ -67,14 +67,71 @@ pub struct Baseline {
     pub std: Vec<f64>,
 }
 
+// --- R0 baseline window (SAMPLING_CONTRACT.md, "The R0 window contract") ---
+//
+// A declared window (`Baseline::from_samples_with_window`, or an explicit
+// `r0_samples` threaded from a manifest / preset / model) always wins and is used
+// verbatim: whoever declares a window owns the duration-to-count conversion the
+// contract requires, `round(duration_s * sr)`. `R0_WINDOW_DEFAULT` means "no
+// window declared", *not* "zero samples" -- reduce the recording with
+// `r0_window_samples` below.
+pub const R0_WINDOW_DEFAULT: usize = 0;
+/// Fraction of the recording the baseline window spans when nothing is declared.
+/// The same fraction `HARDWARE.md` (`cutoff = sample_count * 0.15`) and
+/// `data-commons/docs/wire-protocol.md` ("median of first 15%") specify.
+pub const R0_WINDOW_FRACTION: f64 = 0.15;
+/// Floor: below ~5 samples the median is one or two readings and a single ADC LSB
+/// moves R0 by 10-20%.
+pub const R0_WINDOW_MIN_SAMPLES: usize = 5;
+/// Ceiling: on a long recording an unbounded 15% would swallow the onset, so the
+/// baseline must stay inside the leading plateau.
+pub const R0_WINDOW_MAX_SAMPLES: usize = 30;
+
+/// Number of leading samples forming the R0 baseline window.
+///
+/// `declared` is a caller/manifest-declared window and is returned verbatim
+/// (`R0_WINDOW_DEFAULT` means "not declared"). Otherwise the contract default
+/// applies: `clamp(floor(0.15 * n_samples), 5, 30)`.
+///
+/// **The default window is cadence-independent**; a fixed sample count is not.
+/// `n_samples` grows with the rate, so `0.15 * n_samples` spans `0.15 * T`
+/// *seconds* of recording whether it was sampled at 1, 2, 10 or 100 Hz -- the same
+/// invariance `SAMPLING_CONTRACT.md` hard rule 5 demands, obtained without needing
+/// a declared rate (the auto-R0 path exists precisely for recordings that have no
+/// separate baseline session and so no trusted `sr`). The superseded fixed
+/// 15-sample default spanned 1.5 s at 10 Hz against 15 s at 1 Hz, silently
+/// rescaling R0 and every feature divided by it by up to 10x.
+///
+/// The clamps are the documented cost and are themselves sample counts, so they
+/// are cadence-*dependent*: below 34 samples the floor binds and above 200 the
+/// ceiling does. Invariance is exact only for `34 <= n_samples <= 200`.
+pub fn r0_window_samples(n_samples: usize, declared: usize) -> usize {
+    if declared != R0_WINDOW_DEFAULT {
+        return declared.max(1);
+    }
+    let fraction = (n_samples as f64 * R0_WINDOW_FRACTION).floor() as usize;
+    fraction.clamp(R0_WINDOW_MIN_SAMPLES, R0_WINDOW_MAX_SAMPLES)
+}
+
 impl Baseline {
+    /// R0 = per-channel median of the leading contract window
+    /// (`r0_window_samples(n, R0_WINDOW_DEFAULT)`).
     pub fn from_samples(samples: &[Vec<f64>]) -> Self {
+        Self::from_samples_with_window(samples, R0_WINDOW_DEFAULT)
+    }
+
+    /// R0 = per-channel median of the leading `r0_samples` rows. Pass
+    /// `R0_WINDOW_DEFAULT` (or use [`Baseline::from_samples`]) for the
+    /// cadence-independent contract default; pass any other value to honour a
+    /// window declared by a manifest, preset or trained model.
+    pub fn from_samples_with_window(samples: &[Vec<f64>], r0_samples: usize) -> Self {
         if samples.is_empty() {
             return Self { r0: vec![], n_samples: 0, std: vec![] };
         }
         let n_channels = samples[0].len();
-        let baseline_end = (samples.len() as f64 * 0.15) as usize;
-        let baseline_end = baseline_end.max(1);
+        // The floor of 5 can exceed a very short recording, so bound the slice
+        // by the row count: `n_samples` reports what was actually used.
+        let baseline_end = r0_window_samples(samples.len(), r0_samples).min(samples.len());
 
         let mut r0 = Vec::with_capacity(n_channels);
         let mut std = Vec::with_capacity(n_channels);
@@ -138,7 +195,8 @@ pub use features::{FeatureGroup, extract_features, extract_features_with_sr,
 pub use anomaly::{AnomalyDetector, AnomalyScore, AnomalyMethod};
 pub use calibration::{AutoTune, Calibrator, CalibrationProfile, CrossDeviceCalibrator};
 pub use health::{HealthMonitor, SensorHealth, HealthStatus, FleetHealth, fisher_discriminant_ratio, pairwise_fdr, euclidean_distance, cosine_similarity, similarity_warning};
-pub use protocol::{OsmProtocol, OsmMessage};
+pub use protocol::{OsmProtocol, OsmMessage, format_event, KNOWN_PHASE_LABELS,
+                   SAMPLE_INDEX_DEVICE_ASSIGNED};
 pub use preprocessing::{RawData, BaselineCorrection, BaselineMethod, SignalFilter, FilterType, WindowExtractor, DataValidator};
 pub use adaptive::{AdaptiveAnomalyDetector, AdaptiveThreshold, DetectionConfig, FailSafeSystem, LabelingSystem, DetectionResult, AccuracyImprovement, DetectorState, LabelingStats, FailSafeResult, LabelRecord, WARMUP_SECONDS, STUCK_ZERO_SECONDS, WARNING_SECONDS, CRITICAL_SECONDS, EMERGENCY_SECONDS, RESET_NORMAL_SECONDS};
 pub use poisoning::{PoisoningDetector, SensorHealthConfig, SensorHealthStatus, SensorMetrics, DegradationType};
