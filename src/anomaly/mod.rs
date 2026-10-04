@@ -12,6 +12,7 @@ pub mod dual;
 pub mod replay;
 pub mod adapters;
 pub mod ewma;
+pub mod verdict;
 
 pub use dual::{
     AdsorptionConfig, AmbientModel, AmbientReading, DualKalmanEngine, EngineConfig,
@@ -27,6 +28,7 @@ pub use platt::{PlattCalibrator, PlattParams};
 pub use regimes::{RegimeCluster, RegimeConfig, RegimeModel, RegimeTransition, RegimeUpdate};
 pub use stimulus::{HealthFinding, HealthFindingKind, StimulusConfig, StimulusGainTracker, StimulusMeasurement};
 pub use typology::{Typology, TypologyConfig, TypologyHead, TypologyKind};
+pub use verdict::{ArrayVerdict, ChannelEvidence, SensorVerdict, VerdictThresholds};
 
 /// Streamlined, detector-agnostic verdict shared by the replay evaluators.
 #[derive(Debug, Clone)]
