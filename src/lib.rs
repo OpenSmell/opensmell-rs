@@ -86,6 +86,16 @@ impl Baseline {
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .collect();
             vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            // No finite positive sample in the baseline window: the channel is
+            // dead or disconnected. 1.0 is the neutral placeholder used
+            // throughout the feature contract so normalization stays finite and
+            // downstream guards (r0 > 0.0) behave predictably. A zero would
+            // divide by zero in normalize() and poison every window feature.
+            if vals.is_empty() {
+                r0.push(1.0);
+                std.push(0.0);
+                continue;
+            }
             let median = if vals.len().is_multiple_of(2) {
                 (vals[vals.len() / 2 - 1] + vals[vals.len() / 2]) / 2.0
             } else {

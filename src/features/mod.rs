@@ -70,7 +70,7 @@ impl FeatureGroup {
 
 mod anomaly;
 mod classification;
-mod health;
+pub mod health;
 mod kinetics;
 mod selectivity;
 mod temporal;

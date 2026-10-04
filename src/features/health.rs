@@ -6,11 +6,16 @@ pub fn extract(normalized: &[f64], _raw: &[f64], baseline: &Baseline) -> Result<
         // Noise floor: baseline standard deviation
         features.push(baseline.std[ch]);
 
-        // Sensitivity: signal change per unit concentration (approximated by normalized response magnitude)
-        let sensitivity = normalized[ch].abs();
-        features.push(sensitivity);
+        // Sensitivity decay: a single reading carries no decay information.
+        // Pushed as 0.0 rather than omitted so that every feature position
+        // matches names() and stays aligned with the windowed path.
+        features.push(0.0);
 
-        // Hysteresis: for single reading, use direction of deviation
+        // Drift rate: a slope needs at least two samples. Undefined here, and
+        // deliberately 0.0 for the same alignment reason.
+        features.push(0.0);
+
+        // Hysteresis: for a single reading, use direction of deviation
         features.push(if normalized[ch] > 0.0 { 1.0 } else { -1.0 });
     }
     Ok(features)
