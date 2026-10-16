@@ -3,8 +3,8 @@
 **Status.** All four benchmarks verified (Sep 16). Results in
 `reports/bench_dynamic_memory.json`, `reports/bench_detector_memory_fp.json`,
 `reports/bench_identifiability.json`, `reports/bench_features_audit.json`.
-Companion documents: `anomaly-engine-design.md` (§11.12), `reports/README.md`
-(wave-4 table).
+Companion documents: `anomaly-engine-design.md` (§11.12),
+`private/OPENSMELL_MASTER.md` (Part II wave-4 table).
 
 > **Reproducibility gap.** This document previously said "Reproducible via
 > `python benchmarks/run_all.py`". That script and the `benchmarks/` directory
@@ -21,8 +21,8 @@ Companion documents: `anomaly-engine-design.md` (§11.12), `reports/README.md`
 ## 1. Motivation
 
 The wave-3 audit established that drift, environment, and mixture nonlinearity
-are first-order corruptors for MOX arrays (see `reports/README.md` findings
-4–6, 13). Three related questions remained open:
+are first-order corruptors for MOX arrays (see `private/OPENSMELL_MASTER.md`,
+Part II environment audit, findings 4–6, 13). Three related questions remained open:
 
 1. **Memory**: when an exposure ends, how fast does the sensor truly return to
    baseline, and does the *history* of what came before change the *next*
