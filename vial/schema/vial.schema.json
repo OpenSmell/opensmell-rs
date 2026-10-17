@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensmell.org/schema/vial.schema.json",
+  "title": "Osmograph Vial manifest",
+  "description": "Single source of truth for a Vial. Validated by `noses lint`. claims.evidence is mandatory whenever claims.provides is non-empty; paid Vials must be Sealed.",
+  "type": "object",
+  "required": ["vial"],
+  "additionalProperties": true,
+  "properties": {
+    "vial": {
+      "type": "object",
+      "required": ["id", "name", "version", "tier", "license", "min_runtime"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+          "description": "Reverse-DNS identifier, e.g. org.example.fermentation-monitor."
+        },
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+" },
+        "tier": { "enum": ["recipe", "wasm", "sidecar"] },
+        "noses": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^@[a-z0-9_-]+$" },
+          "description": "Author handles (the Nose role)."
+        },
+        "license": { "type": "string", "minLength": 1 },
+        "min_runtime": { "type": "string" }
+      }
+    },
+    "contributes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sources": { "type": "array", "items": { "type": "string" } },
+        "transforms": { "type": "array", "items": { "type": "string" } },
+        "views": { "type": "array", "items": { "type": "string" } },
+        "models": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "network": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[^*]+$" },
+          "description": "Exact hostnames only — no wildcards."
+        },
+        "sensors": { "type": "array", "items": { "type": "string" } },
+        "storage": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "claims": {
+      "type": "object",
+      "properties": {
+        "provides": { "type": "array", "items": { "type": "string" } },
+        "evidence": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "DOI or public-benchmark references. Mandatory when `provides` is set."
+        },
+        "limits": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Envelope this claim holds in (sensor count/type, excluded gases, etc.)."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "provides": { "minItems": 1 } },
+            "required": ["provides"]
+          },
+          "then": { "required": ["evidence"] }
+        }
+      ]
+    },
+    "pricing": {
+      "type": "object",
+      "properties": {
+        "model": { "enum": ["free", "paid-one-time", "paid-subscription"] },
+        "sealed": {
+          "type": "boolean",
+          "description": "Required true for paid Vials — no obfuscated DRM."
+        },
+        "price_usd": { "type": "number", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "model": { "enum": ["paid-one-time", "paid-subscription"] } },
+            "required": ["model"]
+          },
+          "then": { "properties": { "sealed": { "const": true } }, "required": ["sealed"] }
+        }
+      ]
+    },
+    "llms": { "type": "string", "description": "Optional path to an extra LLM doc index." },
+    "mcpServer": { "type": "string", "description": "Optional MCP validator server for agents." }
+  }
+}

@@ -1,0 +1,25 @@
+# noses — Osmograph Vial authoring CLI
+
+> Author, validate, test and publish Osmograph Vials. One `vial.toml` manifest, three
+> tiers (recipe | wasm | sidecar). Target time-to-first-working-Vial: under 60 seconds.
+
+## Commands
+- `noses create <name> [--template recipe|wasm]` — scaffold a working Vial (offline).
+- `noses test [path]` — run fixtures against `recipe.json`; no hardware needed.
+- `noses lint [path]` / `noses validate [path]` — schema, permission and licence checks.
+- `noses dev [path]` — load and hot-reload in Osmograph Desktop.
+- `noses publish [path]` — validate, then OIDC trusted publish (signed artifact).
+
+## Rules an agent must satisfy
+- `claims.evidence` is required whenever `claims.provides` is non-empty.
+- Paid Vials must set `pricing.sealed = true`.
+- `capabilities.network` entries must be exact hostnames (no wildcards).
+- `vial.id` is reverse-DNS; `vial.version` is semver.
+
+## Recipe ops
+mean · min · max · range · first · last · std · delta(a - b)
+
+## Files
+- [README](./README.md)
+- [Vial schema](./schema/vial.schema.json)
+- [Build your first Vial](./docs/BUILD_YOUR_FIRST_VIAL.md)

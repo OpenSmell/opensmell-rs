@@ -1,0 +1,32 @@
+# Vial manifest — the single source of truth.
+# Docs + LLM index: https://opensmell.org/llms.txt
+[vial]
+id = "__ID__"
+name = "__NAME__"
+version = "0.1.0"
+tier = "recipe"
+noses = ["@yourhandle"]
+license = "MIT"
+min_runtime = "0.2.0"
+
+[contributes]
+# TODO: declare what this Vial adds to the app.
+# Namespaces: sources | transforms | views | models
+sources = ["serial.generic"]
+transforms = ["baseline.r0"]
+views = ["olfactogram"]
+
+[capabilities]
+# Least privilege: list only what you need. Network entries must be exact hostnames.
+network = []
+sensors = ["session.readings"]
+storage = ["result.annotations"]
+
+[claims]
+# TODO: what decision does this Vial make? If it provides one, you MUST cite evidence.
+provides = ["change-detection"]
+evidence = ["doi:10.1021/cr068121q"]  # Röck, Bârsan & Weimar, Chem. Rev. 2008
+limits = ["MOX arrays >= 1 channel", "not for toxic gases"]
+
+[pricing]
+model = "free"

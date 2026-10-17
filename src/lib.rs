@@ -190,6 +190,8 @@ pub mod training;
 pub mod live;
 
 pub mod smellability;
+
+pub mod vial;
 pub use features::{FeatureGroup, extract_features, extract_features_with_sr,
                    extract_window_features, extract_window_features_with_sr, feature_names};
 pub use anomaly::{AnomalyDetector, AnomalyScore, AnomalyMethod};

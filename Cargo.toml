@@ -21,6 +21,8 @@ csv = "1"
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 rand = "0.8"
+toml = "0.8"
+semver = "1"
 
 [dev-dependencies]
 env_logger = "0.11"

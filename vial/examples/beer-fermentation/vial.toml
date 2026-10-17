@@ -1,0 +1,26 @@
+[vial]
+id = "org.opensmell.beer-fermentation"
+name = "Beer Fermentation Monitor"
+version = "1.0.0"
+tier = "recipe"
+noses = ["@opensmell"]
+license = "MIT"
+min_runtime = "0.2.0"
+
+[contributes]
+sources = ["serial.generic"]
+transforms = ["baseline.r0", "features.kinetics"]
+views = ["olfactogram", "change-log"]
+
+[capabilities]
+network = []
+sensors = ["session.readings", "session.env"]
+storage = ["result.annotations"]
+
+[claims]
+provides = ["fermentation-change"]
+evidence = ["doi:10.1021/cr068121q"]
+limits = ["MOX arrays >= 2 channels", "relative change only — not absolute CO2 or VOC"]
+
+[pricing]
+model = "free"

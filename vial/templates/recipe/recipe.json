@@ -1,0 +1,10 @@
+{
+  "version": "1.0.0",
+  "steps": [
+    { "op": "mean", "channel": "ch0", "as": "ch0_mean" },
+    { "op": "min", "channel": "ch0", "as": "ch0_min" },
+    { "op": "max", "channel": "ch0", "as": "ch0_max" },
+    { "op": "delta", "a": "ch0_max", "b": "ch0_min", "as": "ch0_span" },
+    { "op": "std", "channel": "ch0", "as": "ch0_std" }
+  ]
+}
