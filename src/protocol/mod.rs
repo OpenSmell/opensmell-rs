@@ -162,19 +162,28 @@ impl OsmProtocol {
             .iter()
             .map(|p| {
                 p.trim().parse::<f64>()
-                    .map_err(|_| OpenSmellError::FeatureExtraction(
+                    .ok()
+                    .filter(|v| v.is_finite())
+                    .ok_or_else(|| OpenSmellError::FeatureExtraction(
                         format!("Invalid float: {}", p)
                     ))
             })
             .collect();
         let channels = channels?;
 
-        // Auto-pad or trim to expected channel count
+        // A short frame is a broken frame, not a reading with implicit zeroes.
+        // Padding here let truncated serial lines reach detectors as plausible
+        // measurements; refusing the line keeps a corrupt byte from becoming
+        // evidence.
         let channels = if self.expected_channels > 0 {
-            let mut ch = channels;
-            while ch.len() < self.expected_channels {
-                ch.push(0.0);
+            if channels.len() < self.expected_channels {
+                return Err(OpenSmellError::FeatureExtraction(format!(
+                    "OSM frame has {} channels, expected {}",
+                    channels.len(),
+                    self.expected_channels
+                )));
             }
+            let mut ch = channels;
             ch.truncate(self.expected_channels);
             ch
         } else {
@@ -641,6 +650,19 @@ mod tests {
             }
             _ => panic!("Expected Data message"),
         }
+    }
+
+    #[test]
+    fn test_parse_osm_line_rejects_short_frame() {
+        let protocol = OsmProtocol::new(6);
+        assert!(protocol.parse_line("OSM,1.234,2.345,3.456", 0.0).is_err());
+    }
+
+    #[test]
+    fn test_parse_osm_line_rejects_non_finite() {
+        let protocol = OsmProtocol::new(3);
+        assert!(protocol.parse_line("OSM,1.0,NaN,3.0", 0.0).is_err());
+        assert!(protocol.parse_line("OSM,1.0,inf,3.0", 0.0).is_err());
     }
 
     #[test]
