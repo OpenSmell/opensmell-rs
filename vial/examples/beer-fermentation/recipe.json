@@ -1,9 +1,0 @@
-{
-  "version": "1.0.0",
-  "steps": [
-    { "op": "mean", "channel": "ch0", "as": "ch0_mean" },
-    { "op": "range", "channel": "ch0", "as": "ch0_range" },
-    { "op": "mean", "channel": "ch1", "as": "ch1_mean" },
-    { "op": "range", "channel": "ch1", "as": "ch1_range" }
-  ]
-}

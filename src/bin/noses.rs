@@ -1,16 +1,17 @@
 //! `noses` — author, validate, test and publish Osmograph Vials.
 //!
-//! One manifest, three tiers (recipe | wasm | sidecar). The loop is the moat:
-//! `create` → `test` (fixtures, no hardware) → `lint` → `publish` (OIDC).
+//! One format: `vial.json` (`osmograph.domain-pack/1`) plus optional sandboxed
+//! HTML fragments beside it. The loop is `new` → `lint` → `test` → `publish`.
 //!
-//! Lives in the core crate so the manifest rules, recipe engine and templates
-//! have exactly one home — shared with the engine itself.
+//! The desktop host is the authority: it re-runs the same gate when a manifest
+//! is installed from a URL or a file, and the sandbox is the execution boundary.
+//! This tool gives the author the answer before pushing; it never replaces the
+//! host gate and it never signs or uploads anything.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use opensmell::vial::manifest::{Diagnostic, Level, VialManifest};
-use opensmell::vial::{recipe, templates};
+use opensmell::vial::{scaffold, Vial};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -28,185 +29,164 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<ExitCode, String> {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     match cmd {
-        "help" | "-h" | "--help" => {
-            print_help();
-            Ok(ExitCode::SUCCESS)
-        }
-        "version" | "-V" | "--version" => {
-            println!("noses {VERSION}");
-            Ok(ExitCode::SUCCESS)
-        }
-        "create" => cmd_create(&args[1..]),
-        "lint" | "validate" => cmd_check(&args[1..]),
+        "help" | "-h" | "--help" => { print_help(); Ok(ExitCode::SUCCESS) }
+        "version" | "-V" | "--version" => { println!("noses {VERSION}"); Ok(ExitCode::SUCCESS) }
+        "new" | "create" => cmd_new(&args[1..]),
+        "lint" | "check" | "validate" => cmd_lint(&args[1..]),
         "test" => cmd_test(&args[1..]),
-        "dev" => cmd_dev(&args[1..]),
         "publish" => cmd_publish(&args[1..]),
-        "update" => {
-            println!("noses update: no-op until the copier template ships.");
-            Ok(ExitCode::SUCCESS)
-        }
         other => Err(format!("unknown command `{other}` (try `noses help`)")),
     }
 }
 
-fn cmd_create(args: &[String]) -> Result<ExitCode, String> {
-    let mut name: Option<String> = None;
-    let mut template = String::from("recipe");
+fn flag(args: &[String], name: &str) -> Option<String> {
+    let inline = format!("--{name}=");
+    if let Some(hit) = args.iter().find(|a| a.starts_with(&inline)) {
+        return Some(hit[inline.len()..].to_string());
+    }
+    let i = args.iter().position(|a| a == &format!("--{name}"))?;
+    args.get(i + 1).cloned()
+}
+
+fn positional(args: &[String]) -> Option<String> {
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--template" | "-t" => {
-                i += 1;
-                template = args.get(i).ok_or("--template needs a value")?.clone();
-            }
-            other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
-            other => name = Some(other.to_string()),
+        let a = &args[i];
+        if a.starts_with('-') {
+            if !a.contains('=') { i += 1; }
+        } else {
+            return Some(a.clone());
         }
         i += 1;
     }
-    let name = name.ok_or("usage: noses create <name> [--template recipe|wasm]")?;
+    None
+}
+
+fn resolve(arg: Option<String>) -> PathBuf {
+    let p = arg.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    if p.is_dir() { p.join("vial.json") } else { p }
+}
+
+fn cmd_new(args: &[String]) -> Result<ExitCode, String> {
+    let name = positional(args).ok_or("usage: noses new <Name> [--publisher <handle>] [--domain <domain>]")?;
+    let publisher = flag(args, "publisher").unwrap_or_else(|| "yourname".to_string());
+    let domain = flag(args, "domain").unwrap_or_else(|| "generic".to_string());
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let dir = templates::create(&name, &template, &cwd)?;
-    println!("Created {template} Vial at {}", dir.display());
-    println!("Next: cd {} && noses test", templates::kebab(&name));
+    let dir = scaffold::create(&name, &publisher, &domain, &cwd)?;
+    println!("Created {}", dir.display());
+    println!();
+    println!("Two gaps are deliberate — `noses lint` refuses until you fill them:");
+    println!("  1. citations is empty: add the real references behind your protocol.");
+    println!("  2. the text carries REPLACE ME markers: write what this Vial is and is not.");
+    println!();
+    println!("Next:");
+    println!("  cd {} && noses lint", dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_check(args: &[String]) -> Result<ExitCode, String> {
-    let path = resolve_manifest(args.first().map(String::as_str))?;
-    let m = VialManifest::load(&path)?;
-    println!("Checking {}", path.display());
-    let diags = m.validate();
-    let has_error = print_diagnostics(&diags);
-    if has_error {
-        return Ok(ExitCode::from(1));
+fn print_validation(vial: &Vial) -> bool {
+    let v = vial.validate();
+    for check in &v.checks {
+        let mark = if check.passed { "✓" } else if check.critical { "✗" } else { "!" };
+        println!("{mark} {:<22} {}", check.label, check.detail);
     }
-    let warns = diags.iter().filter(|d| d.level == Level::Warn).count();
-    println!("✓ {} is valid ({warns} warning(s))", m.id().unwrap_or("vial"));
-    Ok(ExitCode::SUCCESS)
+    println!();
+    if v.passed() {
+        println!("✓ {} is valid ({} warning(s))", vial.id(), v.warnings.len());
+        true
+    } else {
+        println!("✗ {} failed the gate ({} error(s), {} warning(s))", vial.id(), v.errors.len(), v.warnings.len());
+        false
+    }
+}
+
+fn cmd_lint(args: &[String]) -> Result<ExitCode, String> {
+    let path = resolve(positional(args));
+    let vial = Vial::load(&path)?;
+    println!("Checking {}\n", vial.path.display());
+    let ok = print_validation(&vial);
+    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
 
 fn cmd_test(args: &[String]) -> Result<ExitCode, String> {
-    let dir = resolve_vial_dir(args.first().map(String::as_str))?;
-    let m = VialManifest::load(&dir.join("vial.toml"))?;
+    let path = resolve(positional(args));
+    let vial = Vial::load(&path)?;
+    println!("Testing {}\n", vial.path.display());
+    let ok = print_validation(&vial);
 
-    let errs: Vec<_> = m.validate().into_iter().filter(|d| d.level == Level::Error).collect();
-    if !errs.is_empty() {
-        for d in &errs {
-            println!("error: {}", d.message);
+    println!();
+    println!("Programmable surface (static, no hardware)");
+    let mut specs: Vec<(String, String)> = Vec::new();
+    for key in ["ui", "homeUi"] {
+        if let Some(entry) = vial.json.get(key).and_then(|s| s.get("entry")).and_then(|e| e.as_str()) {
+            specs.push((key.to_string(), entry.to_string()));
         }
-        return Err("fix validation errors before testing".into());
     }
-
-    match m.tier() {
-        Some("recipe") => {
-            let recipe_path = dir.join("recipe.json");
-            let text = std::fs::read_to_string(&recipe_path)
-                .map_err(|e| format!("cannot read {}: {e}", recipe_path.display()))?;
-            let recipe: serde_json::Value =
-                serde_json::from_str(&text).map_err(|e| format!("invalid recipe.json: {e}"))?;
-
-            let fixture = dir.join("fixtures/sample.csv");
-            let table = recipe::read_csv(&fixture)?;
-            let out = recipe::evaluate(&recipe, &table)?;
-            println!("Fixture: {} ({} columns, {} rows)", fixture.display(), table.columns.len(), table.rows.len());
-            for (k, v) in &out {
-                println!("  {k} = {v}");
-            }
-
-            let expected_path = dir.join("fixtures/expected.json");
-            if !expected_path.exists() {
-                println!("(no fixtures/expected.json — printing outputs only)");
-                return Ok(ExitCode::SUCCESS);
-            }
-            let et = std::fs::read_to_string(&expected_path).map_err(|e| e.to_string())?;
-            let expected: serde_json::Value = serde_json::from_str(&et).map_err(|e| e.to_string())?;
-            let problems = recipe::compare(&out, &expected, 1e-6);
-            if problems.is_empty() {
-                println!("✓ outputs match expected.json");
-                Ok(ExitCode::SUCCESS)
-            } else {
-                for p in problems {
-                    println!("✗ {p}");
-                }
-                Ok(ExitCode::from(1))
-            }
-        }
-        Some("wasm") => {
-            println!("wasm tier: build with `cargo build --target wasm32-unknown-unknown --release` — fixtures are checked by the host sandbox.");
-            Ok(ExitCode::SUCCESS)
-        }
-        Some("sidecar") => {
-            println!("sidecar tier: run your Python entrypoint; fixtures are passed as files.");
-            Ok(ExitCode::SUCCESS)
-        }
-        _ => Err("unknown tier".into()),
+    if specs.is_empty() {
+        println!("  · no sandboxed UI declared; this Vial is manifest-only");
     }
+    for (key, entry) in specs {
+        let asset = vial.dir().join(&entry);
+        let body = std::fs::read_to_string(&asset).unwrap_or_default();
+        let has = |s: &str| body.contains(s);
+        println!("  {key} → {entry}");
+        println!("    onData           {}", yes_no(has("onData")));
+        println!("    setTransforms    {}", yes_no(has("setTransforms")));
+        println!("    setTrajectory    {}", yes_no(has("setTrajectory")));
+        println!("    setDetection     {}", yes_no(has("setDetection")));
+    }
+    println!();
+    println!("Static checks only. The live proof is the app: install this Vial, arm the");
+    println!("watch on a connected rig, and confirm the host reports the transforms and");
+    println!("the trajectory it actually applied.");
+    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
 
-fn cmd_dev(args: &[String]) -> Result<ExitCode, String> {
-    let dir = resolve_vial_dir(args.first().map(String::as_str))?;
-    let m = VialManifest::load(&dir.join("vial.toml"))?;
-    println!(
-        "Loaded {} ({}) from {}",
-        m.id().unwrap_or("vial"),
-        m.tier().unwrap_or("?"),
-        dir.display()
-    );
-    println!("Open Osmograph Desktop → System → Plugins to load and hot-reload this Vial.");
-    println!("Tip: point your AI at llms.txt + the MCP validator, then `noses lint` in a loop.");
-    Ok(ExitCode::SUCCESS)
+fn yes_no(b: bool) -> &'static str {
+    if b { "declared" } else { "—" }
 }
 
 fn cmd_publish(args: &[String]) -> Result<ExitCode, String> {
-    let path = resolve_manifest(args.first().map(String::as_str))?;
-    let m = VialManifest::load(&path)?;
-    let diags = m.validate();
-    if print_diagnostics(&diags) {
-        return Ok(ExitCode::from(1));
+    let path = resolve(positional(args));
+    let vial = Vial::load(&path)?;
+    println!("Publishing {}\n", vial.path.display());
+    let ok = print_validation(&vial);
+    if !ok {
+        return Err("fix the errors above before publishing".into());
     }
-    println!("✓ {} passed validation", m.id().unwrap_or("vial"));
-    println!("Publishing uses OIDC trusted publishing (no tokens live in the repo):");
-    println!("  1. push this Vial to a public repo;");
-    println!("  2. `noses publish` opens a store PR with a signed artifact + provenance.");
+    let repo = flag(args, "repo").ok_or(
+        "publish needs --repo https://github.com/<owner>/<repo> so the registry entry has real URLs")?;
+    let branch = flag(args, "branch").unwrap_or_else(|| "main".to_string());
+    let evidence = flag(args, "evidence");
+
+    let publisher = vial.id().split('.').next().unwrap_or("");
+    if ["yourname", "you", "author", "example"].contains(&publisher) {
+        return Err(format!(
+            "`{}` is a placeholder publisher; set a real id in vial.json before publishing",
+            publisher
+        ));
+    }
+    if vial.has_ui() {
+        println!();
+        println!("This Vial ships a sandboxed UI. It must be installed from its manifest URL:");
+        println!("push the files first, then confirm the raw URL below serves vial.json AND the");
+        println!("HTML fragments beside it.");
+    }
+
+    let entry = vial.registry_entry(&repo, &branch, evidence.as_deref())?;
+    println!();
+    println!("sha256(vial.json) = {}", vial.sha256_hex());
+    println!();
+    println!("Registry entry (add to public/vials/registry.json in OpenSmell/OpenSmell-web):");
+    println!("{}", serde_json::to_string_pretty(&entry).map_err(|e| e.to_string())?);
+    println!();
+    println!("Steps:");
+    println!("  1. push this directory to {repo} (the manifest must be at the repo root);");
+    println!("  2. verify the raw manifest URL returns exactly these bytes:");
+    println!("     {}", entry["manifestUrl"].as_str().unwrap_or(""));
+    println!("  3. open a PR that adds the entry above. A listing is discovery, not a review:");
+    println!("     every install re-runs this gate and every UI runs in the same sandbox.");
     Ok(ExitCode::SUCCESS)
-}
-
-/// Resolve an argument to a `vial.toml` path (a directory resolves to `vial.toml` inside).
-fn resolve_manifest(arg: Option<&str>) -> Result<PathBuf, String> {
-    let p = match arg {
-        Some(s) => PathBuf::from(s),
-        None => std::env::current_dir().map_err(|e| e.to_string())?,
-    };
-    Ok(if p.is_dir() { p.join("vial.toml") } else { p })
-}
-
-/// Resolve an argument to a Vial directory.
-fn resolve_vial_dir(arg: Option<&str>) -> Result<PathBuf, String> {
-    let p = match arg {
-        Some(s) => PathBuf::from(s),
-        None => std::env::current_dir().map_err(|e| e.to_string())?,
-    };
-    Ok(if p.is_dir() {
-        p
-    } else {
-        p.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
-    })
-}
-
-/// Print diagnostics; returns true if any were errors.
-fn print_diagnostics(diags: &[Diagnostic]) -> bool {
-    let mut has_error = false;
-    for d in diags {
-        match d.level {
-            Level::Error => {
-                println!("error: {}", d.message);
-                has_error = true;
-            }
-            Level::Warn => println!("warning: {}", d.message),
-        }
-    }
-    has_error
 }
 
 fn print_help() {
@@ -214,14 +194,16 @@ fn print_help() {
         "noses {VERSION} — author, validate, test and publish Osmograph Vials\n\
 \n\
 USAGE:\n\
-  noses create <name> [--template recipe|wasm]   scaffold a working Vial\n\
-  noses test  [path]                            run fixtures, no hardware needed\n\
-  noses lint  [path]                            schema + permission + licence checks\n\
-  noses dev   [path]                            load + hot-reload in Osmograph\n\
-  noses publish [path]                          validate, then OIDC trusted publish\n\
+  noses new <Name> [--publisher <handle>] [--domain <domain>]  scaffold a real Vial\n\
+  noses lint [path]                                            the policy gate, locally\n\
+  noses test [path]                                            lint + what the UI declares\n\
+  noses publish [path] --repo <github-url> [--branch main]     hash + registry entry\n\
   noses help | version\n\
 \n\
-A Vial is one `vial.toml` manifest at three tiers: recipe | wasm | sidecar.\n\
+A Vial is one `vial.json` (osmograph.domain-pack/1) plus optional sandboxed\n\
+HTML fragments beside it. The desktop host re-runs the same gate at install and\n\
+is the authority. Nothing here signs or uploads anything.\n\
+\n\
 Docs + LLM index: https://opensmell.org/llms.txt"
     );
 }

@@ -1,8 +1,0 @@
-{
-  "version": "1.0.0",
-  "steps": [
-    { "op": "mean", "channel": "ch0", "as": "ch0_mean" },
-    { "op": "std", "channel": "ch0", "as": "ch0_std" },
-    { "op": "last", "channel": "ch0", "as": "ch0_last" }
-  ]
-}

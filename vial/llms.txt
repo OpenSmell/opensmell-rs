@@ -1,25 +1,46 @@
 # noses — Osmograph Vial authoring CLI
 
-> Author, validate, test and publish Osmograph Vials. One `vial.toml` manifest, three
-> tiers (recipe | wasm | sidecar). Target time-to-first-working-Vial: under 60 seconds.
+> Author, validate, test and publish Osmograph Vials. One format: `vial.json`
+> (`osmograph.domain-pack/1`) plus optional sandboxed HTML fragments beside it.
+> Target time-to-first Vial: under a minute, no hardware.
 
 ## Commands
-- `noses create <name> [--template recipe|wasm]` — scaffold a working Vial (offline).
-- `noses test [path]` — run fixtures against `recipe.json`; no hardware needed.
-- `noses lint [path]` / `noses validate [path]` — schema, permission and licence checks.
-- `noses dev [path]` — load and hot-reload in Osmograph Desktop.
-- `noses publish [path]` — validate, then OIDC trusted publish (signed artifact).
+- `noses new <Name> [--publisher <handle>] [--domain <domain>]` — scaffold a Vial offline.
+  The scaffold fails the gate on purpose (empty citations, `REPLACE ME` markers).
+- `noses lint [path]` / `noses validate [path]` — the policy gate, locally.
+- `noses test [path]` — lint + which bridge calls the UI declares. Static only.
+- `noses publish [path] --repo <github-url> [--branch main] [--evidence A|B|C]` — print
+  `sha256(vial.json)` and the registry entry. It does not sign or upload.
 
 ## Rules an agent must satisfy
-- `claims.evidence` is required whenever `claims.provides` is non-empty.
-- Paid Vials must set `pricing.sealed = true`.
-- `capabilities.network` entries must be exact hostnames (no wildcards).
-- `vial.id` is reverse-DNS; `vial.version` is semver.
+- `schema` is exactly `osmograph.domain-pack/1`; `id` is lowercase `publisher.slug`.
+- `whatItIsNot` (30+ chars) must name the claim the Vial refuses, with an explicit negation.
+- At least one real citation, at least two `docs` sections.
+- Widgets: `hero`, `risk` (with `always` and `never`), `docs`, `rig`, and one of
+  `tracking`, `diagram`, `rules`.
+- High/critical risk: at least one `rules` entry with `severity: "stop"` and three `docs`.
+- No unnegated overclaims: safe to eat, pathogen test/detection, diagnosis, ethylene
+  detection, absolute concentration/ppm, cross-rig, works on any rig/array/device,
+  guarantee, medical diagnosis/device/advice, gas leak detector/certified safety device.
+- No executable content in the manifest. UI code belongs in `ui.html` / `home.html`.
+- A UI is a body fragment (no `doctype`/`html`/`head`/`body`/`base`), no remote assets,
+  no `fetch`/`XMLHttpRequest`/`WebSocket`, no `localStorage`/`sessionStorage`/`indexedDB`,
+  no `eval`/`new Function`, no `javascript:` URLs.
+- Only these bridge methods exist: `version`, `onData`, `action`, `ready`, `toast`,
+  `setDetection`, `setTransforms`, `setTrajectory`.
 
-## Recipe ops
-mean · min · max · range · first · last · std · delta(a - b)
+## Host contract (what a Vial may rely on)
+- Payload: `{ schema, snapshot, series, sources, selectedSource, events, domain, view, host }`.
+- `snapshot.channelLimits[ch] = { dead, cv, min, max, r0 }` — measured, host-owned.
+- `snapshot.detectionConfig`, `snapshot.detection = { active, triggeredChannels }`,
+  `snapshot.baseline = { state, progress, ageSec }`, `snapshot.anomaly`, `snapshot.trajectory`.
+- Transforms: baseline `first-n` · `session-mean`; response `delta-over-r0` · `relative` ·
+  `delta`; conditioning `median3`. Unsupported requests are refused by the host.
+- Single-unit limits only. `4 × measured cv` is the suggested starting point, not a claim.
+- Dead channels are excluded; a Vial may tighten a limit but never bypass a refusal.
 
 ## Files
 - [README](./README.md)
-- [Vial schema](./schema/vial.schema.json)
 - [Build your first Vial](./docs/BUILD_YOUR_FIRST_VIAL.md)
+- [Example](./examples/minimal)
+- [The gate (source of truth for the mirror)](../src/vial/pack.rs)

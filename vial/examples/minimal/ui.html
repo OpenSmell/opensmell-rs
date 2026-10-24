@@ -1,0 +1,132 @@
+<style>
+.mc { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(220px, .7fr); gap: 12px; padding: 12px; box-sizing: border-box; height: 100%; min-height: 430px; background: var(--bg); color: var(--ink); }
+.mc * { box-sizing: border-box; }
+.mc-panel { border: 1px solid var(--line); background: var(--panel); padding: 11px 12px; min-width: 0; }
+.mc-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 8px; font-family: var(--mono); font-size: 8px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted-2); }
+.mc h1 { margin: 2px 0 4px; font-size: 18px; letter-spacing: -.02em; font-weight: 650; }
+.mc-pipe { font-family: var(--mono); font-size: 8px; color: var(--muted); margin-bottom: 10px; }
+.mc-table { width: 100%; border-collapse: collapse; }
+.mc-table th { text-align: left; font-family: var(--mono); font-size: 7px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted-2); padding: 0 4px 4px; border-bottom: 1px solid var(--line); }
+.mc-table td { padding: 5px 4px; border-bottom: 1px solid var(--line); font-size: 11px; font-variant-numeric: tabular-nums; }
+.mc-table td.num { font-family: var(--mono); text-align: right; }
+.mc-table tr.dead { color: var(--muted-2); }
+.mc-input { width: 72px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); padding: 3px 5px; font-family: var(--mono); font-size: 11px; text-align: right; }
+.mc-actions { display: flex; gap: 6px; margin-top: 9px; }
+.mc button { border: 1px solid var(--line-strong); background: var(--panel); color: var(--ink); padding: 5px 10px; font-family: var(--mono); font-size: 9px; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
+.mc button.primary { background: var(--ink); border-color: var(--ink); color: var(--bg); }
+.mc-status { margin-top: 8px; font-size: 10px; color: var(--muted); line-height: 1.45; }
+.mc-kv { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; padding: 3px 0; border-bottom: 1px solid var(--line); }
+.mc-kv span:last-child { font-family: var(--mono); }
+.mc-alert { border-left: 2px solid var(--red); padding-left: 8px; font-size: 10px; }
+.mc-ok { border-left: 2px solid var(--line-strong); padding-left: 8px; font-size: 10px; color: var(--muted); }
+</style>
+
+<div class="mc">
+  <section class="mc-panel">
+    <div class="mc-head"><span>Live array · sandbox</span><span id="src">waiting</span></div>
+    <h1>Minimal Change Log</h1>
+    <div class="mc-pipe" id="pipe">transforms: not declared yet</div>
+    <table class="mc-table">
+      <thead><tr><th>Channel</th><th class="num">ΔR/R₀</th><th class="num">cv</th><th class="num">Watch limit</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="4" style="color:var(--muted)">Waiting for host data.</td></tr></tbody>
+    </table>
+    <div class="mc-actions">
+      <button class="primary" id="arm">Arm watch</button>
+      <button id="off">Disable</button>
+    </div>
+    <div class="mc-status" id="status">No watch armed. The limit is in ΔR/R₀, not concentration.</div>
+  </section>
+  <aside class="mc-panel">
+    <div class="mc-head"><span>Host verdict</span><span id="trail-count">0 pts</span></div>
+    <div id="verdict" class="mc-ok">No config in force.</div>
+    <div class="mc-kv"><span>Baseline</span><span id="base">—</span></div>
+    <div class="mc-kv"><span>Anomaly</span><span id="anom">—</span></div>
+    <div class="mc-kv"><span>Channels</span><span id="chans">—</span></div>
+  </aside>
+</div>
+<script>
+(function () {
+  "use strict";
+  var latest = null;
+  var manual = {};
+
+  function fmt(v, d) {
+    return (v === null || v === undefined || !isFinite(v)) ? "—" : Number(v).toFixed(d);
+  }
+
+  function paint() {
+    var s = latest && latest.snapshot;
+    var series = latest && latest.series;
+    var resp = series && series.response && series.response.values;
+    var body = document.getElementById("rows");
+    if (!s || !s.channels || !s.channels.length) {
+      body.innerHTML = '<tr><td colspan="4" style="color:var(--muted)">Waiting for host data.</td></tr>';
+      return;
+    }
+    var html = "";
+    s.channels.forEach(function (ch, i) {
+      var lim = s.channelLimits && s.channelLimits[ch.id];
+      var dead = !lim || lim.dead;
+      var last = resp && resp[i] ? resp[i][resp[i].length - 1] : null;
+      var value = manual[ch.id] !== undefined ? manual[ch.id] : (lim && !dead ? (lim.cv * 4).toFixed(3) : "");
+      html += '<tr class="' + (dead ? "dead" : "") + '"><td>' + ch.id + (dead ? " · no limit" : "") + '</td>'
+        + '<td class="num">' + fmt(last, 3) + '</td>'
+        + '<td class="num">' + (lim ? fmt(lim.cv, 4) : "—") + '</td>'
+        + '<td class="num"><input class="mc-input" data-ch="' + ch.id + '" type="number" step="0.001" min="0"'
+        + (dead ? " disabled" : "") + ' value="' + value + '"></td></tr>';
+    });
+    body.innerHTML = html;
+    document.getElementById("src").textContent = s.source;
+    document.getElementById("pipe").textContent = s.transformsApplied && s.transformsApplied.length
+      ? "host transforms: " + s.transformsApplied.join(" · ") : "transforms: not declared yet";
+    document.getElementById("base").textContent = s.baseline.state + " · " + Math.round((s.baseline.progress || 0) * 100) + "%";
+    document.getElementById("anom").textContent = s.anomaly.state + (s.anomaly.score !== null ? " · " + fmt(s.anomaly.score, 2) : "");
+    var dead = 0;
+    for (var k in s.channelLimits) { if (s.channelLimits[k].dead) dead++; }
+    document.getElementById("chans").textContent = s.channels.length + " · " + dead + " dead";
+    var trail = s.trajectory || [];
+    document.getElementById("trail-count").textContent = trail.length + " pts";
+    var verdict = document.getElementById("verdict");
+    if (s.detection && s.detection.triggeredChannels && s.detection.triggeredChannels.length) {
+      verdict.className = "mc-alert";
+      verdict.textContent = "Watch triggered on " + s.detection.triggeredChannels.join(", ") + ". The array cannot tell you why.";
+    } else if (s.detectionConfig) {
+      verdict.className = "mc-ok";
+      verdict.textContent = "Armed on " + Object.keys(s.detectionConfig.perChannelLimits || {}).length + " channel(s).";
+    } else {
+      verdict.className = "mc-ok";
+      verdict.textContent = "No config in force.";
+    }
+  }
+
+  document.addEventListener("input", function (e) {
+    var el = e.target;
+    if (el && el.getAttribute && el.getAttribute("data-ch")) manual[el.getAttribute("data-ch")] = el.value;
+  });
+
+  document.getElementById("arm").addEventListener("click", function () {
+    var cfg = {};
+    var inputs = document.querySelectorAll("#rows input[data-ch]");
+    for (var i = 0; i < inputs.length; i++) {
+      if (inputs[i].disabled) continue;
+      var v = parseFloat(inputs[i].value);
+      if (isFinite(v) && v > 0) cfg[inputs[i].getAttribute("data-ch")] = v;
+    }
+    if (!Object.keys(cfg).length) {
+      document.getElementById("status").textContent = "No limit to arm: enter a positive ΔR/R₀ limit on a live channel.";
+      return;
+    }
+    window.osmograph.setDetection({ enabled: true, alertThreshold: 0.5, perChannelLimits: cfg });
+    document.getElementById("status").textContent = "Armed on " + Object.keys(cfg).length + " channel(s), in ΔR/R₀ on this array.";
+  });
+  document.getElementById("off").addEventListener("click", function () {
+    window.osmograph.setDetection({ enabled: false, alertThreshold: 0.5, perChannelLimits: {} });
+    document.getElementById("status").textContent = "Watch disabled.";
+  });
+
+  window.osmograph.setTransforms({ baseline: "first-n", response: "delta-over-r0", conditioning: ["median3"] });
+  window.osmograph.setTrajectory({ fields: ["anomaly.score", "anomaly.confidence", "baseline.progress"], intervalMs: 60000 });
+  window.osmograph.onData(function (payload) { latest = payload; paint(); });
+  window.osmograph.ready();
+})();
+</script>

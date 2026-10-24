@@ -1,0 +1,100 @@
+{
+  "schema": "osmograph.domain-pack/1",
+  "id": "opensmell.minimal",
+  "name": "Minimal Change Log",
+  "version": "0.1.0",
+  "author": "@opensmell",
+  "license": "MIT",
+  "risk": "medium",
+  "domain": "sensors",
+  "tagline": "One array, one reference, one honest change.",
+  "summary": "The smallest complete Vial: a sample log, a live ΔR/R₀ panel that declares host transforms and a tracked trajectory, and an explicit limit on what the array can claim.",
+  "whatItIs": "A reference implementation of the Vial contract. It shows how a sandboxed fragment reads the host snapshot, declares transforms and a trajectory, and arms a single-unit watch only when a limit is entered.",
+  "whatItIsNot": "It is not calibrated and not a scientific instrument. It does not identify compounds, quantify concentration, or compare readings from a different array.",
+  "citations": [
+    "Janata, J. (2009). Principles of Chemical Sensors, 2nd ed. Springer. ISBN 978-0-387-69930-1."
+  ],
+  "ui": {
+    "runtime": "sandbox/1",
+    "entry": "ui.html",
+    "height": 460
+  },
+  "widgets": [
+    {
+      "type": "hero",
+      "art": "generic",
+      "title": "Minimal Change Log",
+      "subtitle": "The smallest thing that is still honest.",
+      "note": "Reference Vial · sandboxed fragment · host-owned data"
+    },
+    {
+      "type": "risk",
+      "level": "medium",
+      "headline": "A change is not a verdict.",
+      "body": "The array responds to a mixture of volatiles. A reading says the sample changed on this rig; it does not say what changed.",
+      "always": [
+        "Record the sample, the moment, and the conditions with every reading.",
+        "Compare only against a baseline taken on the same array and preparation."
+      ],
+      "never": [
+        "Never treat a reading as an identification.",
+        "Never compare readings from a different array."
+      ]
+    },
+    {
+      "type": "tracking",
+      "title": "Sample log",
+      "description": "The log is the record. The reading is one column in it.",
+      "fields": [
+        { "id": "sample", "label": "Sample", "type": "text", "placeholder": "what is in the jar" },
+        { "id": "context", "label": "Context", "type": "text", "placeholder": "preparation, room, time" }
+      ],
+      "logFields": [
+        { "id": "reading", "label": "Reading", "type": "number", "placeholder": "0–10" },
+        { "id": "note", "label": "Note", "type": "text", "placeholder": "what you observed" }
+      ],
+      "logLabel": "Add reading"
+    },
+    {
+      "type": "rules",
+      "title": "Stop rules",
+      "rules": [
+        {
+          "when": "A reading moves and nothing you changed explains it",
+          "then": "Re-baseline on the same array and repeat the measurement before acting.",
+          "severity": "warn"
+        },
+        {
+          "when": "A channel is dead, stuck, or saturated",
+          "then": "Stop. Repair or recalibrate before recording again.",
+          "severity": "stop"
+        }
+      ]
+    },
+    { "type": "docs", "title": "Field notes" },
+    {
+      "type": "rig",
+      "title": "Use this with your rig",
+      "body": "Record a clean reference and a sample on the same array. Compare them in Check. If the arrays differ, the app refuses the comparison.",
+      "cta": "Open Check"
+    }
+  ],
+  "docs": [
+    {
+      "id": "how",
+      "title": "How to use this Vial",
+      "body": [
+        "Fill the sample and context fields, then add a reading whenever you measure or observe the sample.",
+        "The UI panel shows the host's own noise per channel. Enter a watch limit in ΔR/R₀ and arm it; the host refuses dead channels and non-live sources."
+      ]
+    },
+    {
+      "id": "sensor",
+      "title": "What the array is doing",
+      "body": [
+        "A MOX array responds to a mixture of volatile compounds. Temperature, humidity, distance, and sample preparation all change the reading.",
+        "The useful signal is a change relative to a reference on the same array. The absolute number does not transfer to another rig."
+      ]
+    }
+  ]
+}

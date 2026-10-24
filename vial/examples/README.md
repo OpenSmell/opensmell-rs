@@ -1,20 +1,22 @@
-# Example Vials (the gallery)
+# Vial examples
 
-Official, validated Vials. Each is a real, honest example and a live test — the
-`example_vials_are_valid_and_fixtures_match` unit test runs every one so the gallery
-can't rot.
+One example lives here, and it is validated by a unit test so it cannot rot:
 
-| Vial | Claim | Why it's honest |
-|---|---|---|
-| [`beer-fermentation`](./beer-fermentation) | fermentation-change | reports *relative* change, never absolute CO2/VOC |
-| [`cold-chain`](./cold-chain) | spoilage-risk | sealed storage only; change vs baseline, not species ID |
-| [`leak-alarm`](./leak-alarm) | leak-alarm | one dedicated target; not a certified toxic-gas detector |
+- [`minimal/`](./minimal) — the smallest complete Vial. A sample log, a live ΔR/R₀ panel
+  that declares host transforms and a tracked trajectory, and an explicit statement of what
+  the array cannot claim.
 
-Run any of them without hardware:
+The two live packs are author-hosted repositories, not bundled examples:
+
+- [`praisejamesx/fermentation-lab`](https://github.com/praisejamesx/fermentation-lab) —
+  high risk, stop rules, batch log, single-unit watch.
+- [`praisejamesx/plant-respiration`](https://github.com/praisejamesx/plant-respiration) —
+  medium risk, weekly trend, explicit blind spot (no ethylene channel).
+
+Run the gate against any of them:
 
 ```
-noses test examples/beer-fermentation
-noses lint examples/beer-fermentation
+cargo run --bin noses -- lint   vial/examples/minimal
+cargo run --bin noses -- test   vial/examples/minimal
+cargo run --bin noses -- lint   ~/code/osmograph-vials/plant-respiration
 ```
-
-Add your own: `noses create "My Vial"` then submit a PR — the same test will validate it.
