@@ -42,7 +42,7 @@ pub fn create(name: &str, publisher: &str, domain: &str, parent: &Path) -> Resul
 
     let id = format!("{publisher}.{slug}");
     let manifest = json!({
-        "schema": "osmograph.domain-pack/1",
+        "schema": "osmograph.domain-pack/2",
         "id": id,
         "name": name,
         "version": "0.1.0",
@@ -51,9 +51,41 @@ pub fn create(name: &str, publisher: &str, domain: &str, parent: &Path) -> Resul
         "risk": "medium",
         "domain": domain,
         "tagline": "REPLACE ME: one honest line about this workspace.",
-        "summary": "REPLACE ME: what this workspace logs, what it measures, and what it refuses to claim.",
-        "whatItIs": "REPLACE ME: the protocol or useful claim this Vial carries.",
-        "whatItIsNot": "It is not a laboratory instrument. It does not identify compounds, quantify concentration, or compare readings from a different array.",
+        "summary": "REPLACE ME: the decision this workspace supports, the context it records, and the evidence behind it.",
+        "scope": "REPLACE ME: the one repeated decision this Vial supports on one array and one preparation.",
+        "limits": [
+            "REPLACE ME: the conditions where this profile refuses to arm or where the user must stop."
+        ],
+        "anomaly": {
+            "baseline": { "protocol": "first-n", "warmupS": 6.0, "r0WindowS": 10.0 },
+            "transforms": { "conditioning": [], "response": "delta-over-r0" },
+            "detection": {
+                "enabled": true,
+                "sensitivity": 1.0,
+                "minChannels": 1,
+                "levelBudget": 0.0,
+                "levelRefS": 0.0,
+                "alertThreshold": 0.5,
+                "perChannelLimits": {},
+                "hysteresis": 0.0,
+                "escalation": {
+                    "warningS": 0.2,
+                    "criticalS": 0.5,
+                    "emergencyS": 1.0,
+                    "resetNormalS": 2.0
+                },
+                "farTargetPerMonth": null
+            },
+            "admissibility": { "requireBaseline": "ready", "minCoverage": 0.8 }
+        },
+        "evidence": {
+            "grade": "D",
+            "reportUrl": "",
+            "measuredAt": "",
+            "dataset": "",
+            "metrics": {},
+            "fixtures": []
+        },
         "citations": [],
         "ui": { "runtime": "sandbox/1", "entry": "ui.html", "height": 520 },
         "widgets": [
@@ -67,8 +99,8 @@ pub fn create(name: &str, publisher: &str, domain: &str, parent: &Path) -> Resul
             {
                 "type": "risk",
                 "level": "medium",
-                "headline": "A change on this array is not a verdict.",
-                "body": "The array responds to a mixture of volatiles. A reading is evidence that the sample changed on this rig, not what changed or why.",
+                "headline": "A change on this array is evidence for a person to interpret.",
+                "body": "The array responds to a mixture of volatiles. A reading is evidence that the sample changed on this rig; the primary measurement decides what that means.",
                 "always": [
                     "Record the sample, the moment, and the conditions with every reading.",
                     "Compare only against a baseline taken on the same array and the same preparation."
@@ -139,8 +171,8 @@ pub fn create(name: &str, publisher: &str, domain: &str, parent: &Path) -> Resul
                 "id": "limits",
                 "title": "Limits",
                 "body": [
-                    "This scaffold does not yet name a scientific claim. Add the real references behind your protocol to citations; the gate refuses a Vial without them.",
-                    "This is not a diagnosis, a safety verdict, or a calibrated concentration."
+                    "Add the real references behind your protocol to citations; the gate refuses a Vial without them.",
+                    "The primary measurement decides the action. The sensor stays one column in the record."
                 ]
             }
         ]
@@ -171,31 +203,32 @@ fn readme(name: &str, id: &str) -> String {
 
 | File | Role |
 |---|---|
-| `vial.json` | The manifest (`osmograph.domain-pack/1`). The host re-runs this gate at install. |
+| `vial.json` | The manifest (`osmograph.domain-pack/2`): profile, UI, and evidence. The host re-runs this gate at install. |
 | `ui.html` | A sandboxed body fragment. No network, no storage, no Tauri, no external files. |
 | `README.md` | This file. |
 
 ## The loop
 
 ```
-noses lint      # schema, claims, UI sandbox and bridge, placeholders
-noses test      # lint + what the UI actually declares
-noses publish   # sha256 + the exact registry entry to open a PR with
+noses lint      # schema, profile, evidence, UI sandbox, placeholders
+noses test      # lint + profile fixtures + what the UI declares
+noses publish   # sha256 + asset hashes + the registry entry
 ```
 
-`noses new` leaves **two deliberate gaps**: `citations` is empty and the text
-carries `REPLACE ME` markers. Both are errors in the gate, so `lint` refuses
-until you write real text. That is the point: a scaffold must never be
-publishable by accident.
+`noses new` leaves **three deliberate gaps**: `citations` is empty, the text
+carries `REPLACE ME` markers, and the evidence block has no report yet. All
+three are errors in the gate, so `lint` refuses until you write real text and
+record real evidence. A scaffold is a starting point, never a publishable
+placeholder.
 
 ## What the host owns
 
 - Sampling, baseline, anomaly detection, and the hardware-sufficiency gate.
-- The transforms (declared through `osmograph.setTransforms`) and the
-  trajectory persisted every interval (`osmograph.setTrajectory`).
+- The profile transforms compiled from `vial.json`, and the trajectory the UI
+  asks the host to persist (`osmograph.setTrajectory`).
 - The single-unit limits (`channelLimits`: measured `cv`, `min`, `max`, `r0`)
-  and whether a channel is dead. A Vial may tighten a limit, never bypass a
-  refusal.
+  and whether a channel is dead. The profile limits are read-only at runtime;
+  a Vial may tighten a limit, never bypass a refusal.
 
 Your UI receives a typed snapshot (`payload.snapshot`) and a bounded series
 window (`payload.series`). It never gets raw buffers and never owns the
@@ -248,6 +281,7 @@ const UI_HTML: &str = r##"<style>
 .np-kv span:last-child { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .np-alert { border-left: 2px solid var(--red); padding-left: 8px; font-size: 10px; color: var(--ink); }
 .np-ok { border-left: 2px solid var(--line-strong); padding-left: 8px; font-size: 10px; color: var(--muted); }
+.np-warn { border-left: 2px solid var(--amber); padding-left: 8px; font-size: 10px; color: var(--ink); }
 .np-trail { font-family: var(--mono); font-size: 9px; color: var(--muted); max-height: 86px; overflow: hidden; }
 </style>
 
@@ -260,21 +294,21 @@ const UI_HTML: &str = r##"<style>
     <h1>__PACK_NAME__</h1>
     <div class="np-pipe" id="np-pipe">transforms: not declared yet</div>
     <table class="np-table">
-      <thead><tr><th>Channel</th><th class="num">ΔR/R₀</th><th class="num">cv</th><th class="num">R₀</th><th class="num">Watch limit</th></tr></thead>
+      <thead><tr><th>Channel</th><th class="num">ΔR/R₀</th><th class="num">cv</th><th class="num">R₀</th><th class="num">Profile limit</th></tr></thead>
       <tbody id="np-rows"><tr><td colspan="5" style="color:var(--muted)">Waiting for host data. Connect a rig or open a recording; this panel reads only what the host sends.</td></tr></tbody>
     </table>
     <div class="np-actions">
-      <button class="primary" id="np-arm">Arm watch</button>
-      <button id="np-disarm">Disable</button>
+      <button class="primary" id="np-log">Log reading</button>
+      <button id="np-export">Export log</button>
     </div>
-    <div class="np-status" id="np-status">No watch armed. The limit is in ΔR/R₀, not concentration.</div>
+    <div class="np-status" id="np-status">The profile is compiled from the manifest. The host owns the detector; this panel displays the verdict.</div>
   </section>
   <aside class="np-right">
     <section class="np-panel">
       <div class="np-head"><span class="np-eyebrow">Host verdict</span></div>
       <div id="np-verdict" class="np-ok">No config in force.</div>
       <div class="np-kv"><span>Baseline</span><span id="np-base">—</span></div>
-      <div class="np-kv"><span>Anomaly</span><span id="np-anom">—</span></div>
+      <div class="np-kv"><span>Engine</span><span id="np-anom">—</span></div>
       <div class="np-kv"><span>Channels</span><span id="np-chans">—</span></div>
     </section>
     <section class="np-panel">
@@ -286,8 +320,6 @@ const UI_HTML: &str = r##"<style>
 <script>
 (function () {
   "use strict";
-  var LIM = {};
-  var ARMED = false;
   var LATEST = null;
 
   function fmt(v, digits) {
@@ -312,16 +344,15 @@ const UI_HTML: &str = r##"<style>
       var lim = (s.channelLimits && s.channelLimits[ch.id]) || null;
       var dead = !lim || lim.dead;
       var last = resp && resp[i] ? resp[i][resp[i].length - 1] : null;
-      var key = ch.id;
-      var prev = LIM[key];
-      LIM[key] = prev;
+      var declared = s.detectionConfig && s.detectionConfig.perChannelLimits
+        ? s.detectionConfig.perChannelLimits[ch.id]
+        : null;
       html += '<tr class="' + (dead ? "dead" : "") + '">'
         + '<td>' + ch.id + (dead ? " · no limit" : "") + '</td>'
         + '<td class="num">' + fmt(last, 3) + '</td>'
         + '<td class="num">' + (lim ? fmt(lim.cv, 4) : "—") + '</td>'
         + '<td class="num">' + (lim && lim.r0 !== null ? Math.round(lim.r0) : "—") + '</td>'
-        + '<td class="num"><input class="np-input" data-ch="' + key + '" type="number" step="0.001" min="0"'
-        + (dead ? " disabled" : "") + ' value="' + (prev !== undefined ? prev : (lim && !dead ? (lim.cv * 4).toFixed(3) : "")) + '"></td>'
+        + '<td class="num">' + (declared !== null && declared !== undefined ? fmt(declared, 3) : "—") + '</td>'
         + '</tr>';
     });
     body.innerHTML = html;
@@ -332,19 +363,22 @@ const UI_HTML: &str = r##"<style>
     var det = s && s.detection;
     var cfg = s && s.detectionConfig;
     if (cfg && det) {
-      if (det.triggeredChannels && det.triggeredChannels.length) {
+      if (det.admissible === false) {
+        verdict.className = "np-warn";
+        verdict.textContent = "Not armed: " + (det.reason || "the profile admissibility gate refused.");
+      } else if (det.triggeredChannels && det.triggeredChannels.length) {
         verdict.className = "np-alert";
-        verdict.textContent = "Watch triggered on " + det.triggeredChannels.join(", ") + ". Look at the sample; the array cannot tell you why.";
+        verdict.textContent = "Profile triggered on " + det.triggeredChannels.join(", ") + ". Confirm the cause with the primary measurement.";
       } else {
         verdict.className = "np-ok";
-        verdict.textContent = "Armed on " + Object.keys(cfg.perChannelLimits || {}).length + " channel(s). No channel over its limit.";
+        verdict.textContent = "Profile active on " + Object.keys(cfg.perChannelLimits || {}).length + " channel(s). No channel over its limit.";
       }
     } else if (cfg) {
       verdict.className = "np-ok";
-      verdict.textContent = "Config declared; the host has not evaluated a live window yet.";
+      verdict.textContent = "Profile declared; the host has not evaluated a live window yet.";
     } else {
       verdict.className = "np-ok";
-      verdict.textContent = "No config in force.";
+      verdict.textContent = "No profile in force.";
     }
     var base = s && s.baseline ? s.baseline.state + " · " + Math.round((s.baseline.progress || 0) * 100) + "%" : "—";
     document.getElementById("np-base").textContent = base;
@@ -370,34 +404,17 @@ const UI_HTML: &str = r##"<style>
       document.getElementById("np-trail").textContent = new Date(p.at).toLocaleTimeString() + " · " + parts.join(" · ");
     }
   }
-  function arm() {
-    var inputs = document.querySelectorAll("#np-rows input[data-ch]");
-    var cfg = {};
-    for (var i = 0; i < inputs.length; i++) {
-      var el = inputs[i];
-      if (el.disabled) continue;
-      LIM[el.getAttribute("data-ch")] = el.value;
-      var v = parseFloat(el.value);
-      if (isFinite(v) && v > 0) cfg[el.getAttribute("data-ch")] = v;
-    }
-    if (!Object.keys(cfg).length) {
-      document.getElementById("np-status").innerHTML = "<b>No limit to arm.</b> Enter a positive ΔR/R₀ limit on at least one live channel.";
-      return;
-    }
-    ARMED = true;
-    window.osmograph.setDetection({ enabled: true, alertThreshold: 0.5, perChannelLimits: cfg });
-    document.getElementById("np-status").innerHTML = "<b>Armed on " + Object.keys(cfg).length + " channel(s).</b> Limits are in ΔR/R₀ on this array. The host refuses dead channels and non-live sources.";
-  }
-  function disarm() {
-    ARMED = false;
-    window.osmograph.setDetection({ enabled: false, alertThreshold: 0.5, perChannelLimits: {} });
-    document.getElementById("np-status").innerHTML = "<b>Watch disabled.</b> No config is in force.";
-  }
+  document.getElementById("np-log").addEventListener("click", function () {
+    window.osmograph.action({
+      type: "add-log",
+      values: { reading: new Date().toISOString(), note: "Reviewed the live verdict" }
+    });
+    document.getElementById("np-status").innerHTML = "<b>Reading logged.</b> The log is local and can be exported.";
+  });
+  document.getElementById("np-export").addEventListener("click", function () {
+    window.osmograph.action({ type: "export-log" });
+  });
 
-  document.getElementById("np-arm").addEventListener("click", arm);
-  document.getElementById("np-disarm").addEventListener("click", disarm);
-
-  window.osmograph.setTransforms({ baseline: "first-n", response: "delta-over-r0", conditioning: ["median3"] });
   window.osmograph.setTrajectory({
     fields: ["anomaly.score", "anomaly.confidence", "baseline.progress"],
     intervalMs: 60000

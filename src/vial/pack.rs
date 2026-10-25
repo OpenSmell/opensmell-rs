@@ -7,9 +7,11 @@
 //! so an author gets the answer locally, before pushing — it never replaces the
 //! host gate. When the two disagree, the host wins.
 //!
-//! One format: `vial.json` with schema `osmograph.domain-pack/1`, plus optional
-//! sandboxed HTML fragments (`ui.html`, `home.html`) beside it. There is no
-//! second manifest format and no privileged tier.
+//! One format: `vial.json` with schema `osmograph.domain-pack/2` — the
+//! programmable profile, the UI contract, and the evidence — plus optional
+//! sandboxed HTML fragments (`ui.html`, `home.html`) beside it. `/1` is accepted
+//! as a legacy manifest but cannot be listed in the registry. There is no
+//! privileged tier.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -93,6 +95,30 @@ impl Vial {
         self.json.get("ui").map(|v| !v.is_null()).unwrap_or(false)
             || self.json.get("homeUi").map(|v| !v.is_null()).unwrap_or(false)
     }
+    pub fn is_v2(&self) -> bool {
+        self.str("schema") == "osmograph.domain-pack/2"
+    }
+    /// Positive scope. v2 uses `scope`; v1 used `whatItIs`.
+    pub fn scope(&self) -> &str {
+        let scope = self.str("scope");
+        if scope.is_empty() { self.str("whatItIs") } else { scope }
+    }
+    pub fn limits(&self) -> Vec<String> {
+        let declared: Vec<String> = arr(&self.json, "limits").iter()
+            .filter_map(Value::as_str).map(str::to_string).collect();
+        if declared.is_empty() {
+            let legacy = self.str("whatItIsNot").trim();
+            if legacy.is_empty() { Vec::new() } else { vec![legacy.to_string()] }
+        } else {
+            declared
+        }
+    }
+    pub fn anomaly(&self) -> Option<&Value> {
+        self.json.get("anomaly").filter(|v| v.is_object())
+    }
+    pub fn evidence(&self) -> Option<&Value> {
+        self.json.get("evidence").filter(|v| v.is_object())
+    }
     pub fn dir(&self) -> &Path {
         self.path.parent().unwrap_or_else(|| Path::new("."))
     }
@@ -108,8 +134,13 @@ impl Vial {
         let mut chunks: Vec<String> = vec![
             self.id().into(), self.name().into(), self.author().into(), self.license().into(),
             self.domain().into(), self.tagline().into(), self.summary().into(),
-            self.str("whatItIs").into(), self.str("whatItIsNot").into(),
+            self.scope().into(),
         ];
+        for limit in self.limits() { chunks.push(limit); }
+        if let Some(ev) = self.evidence() {
+            chunks.push(text(ev, "dataset"));
+            chunks.push(text(ev, "reportUrl"));
+        }
         for c in arr(&self.json, "citations") {
             if let Some(s) = c.as_str() { chunks.push(s.to_string()); }
         }
@@ -133,8 +164,14 @@ impl Vial {
         let mut v = Validation::default();
         let j = &self.json;
 
-        v.add("schema", "Manifest schema", self.str("schema") == "osmograph.domain-pack/1", true,
-              "Expected osmograph.domain-pack/1.");
+        let is_v2 = self.is_v2();
+        v.add("schema", "Manifest schema",
+              self.str("schema") == "osmograph.domain-pack/1" || is_v2, true,
+              if is_v2 {
+                  "osmograph.domain-pack/2: profile, UI, and evidence."
+              } else {
+                  "Legacy osmograph.domain-pack/1. Installable; re-author as v2 to be listed."
+              });
 
         if let Some(min) = j.get("minHost").and_then(Value::as_str) {
             let ok = semver::Version::parse(min).is_ok()
@@ -168,14 +205,24 @@ impl Vial {
         v.add("summary", "Summary", in_range(self.summary(), 30, 600), true,
               "Explain the workspace and its scope.");
 
-        let what_it_is = self.str("whatItIs");
-        let what_it_is_not = self.str("whatItIsNot");
-        v.add("what-it-is", "What it is", what_it_is.trim().len() >= 30, true,
-              "State the useful claim or protocol.");
-        let refuses = Regex::new(r"(?i)(?:not|cannot|no\s|never|without|refuse)").unwrap();
-        v.add("what-it-is-not", "What it is not",
-              what_it_is_not.trim().len() >= 30 && refuses.is_match(what_it_is_not), true,
-              "Name the claim you refuse to make (30+ characters, with an explicit negation).");
+        v.add("scope", "Scope", self.scope().trim().len() >= 30, true,
+              "State the decision this Vial supports.");
+        if is_v2 {
+            let limits = self.limits();
+            v.add("limits", "Operating envelope",
+                  !limits.is_empty() && limits.iter().all(|l| l.trim().len() >= 10), true,
+                  "Name at least one condition where the Vial refuses or stops.");
+            validate_anomaly(j, &mut v);
+            validate_evidence(j, &mut v);
+        } else {
+            let what_it_is_not = self.str("whatItIsNot");
+            let refuses = Regex::new(r"(?i)(?:not|cannot|no\s|never|without|refuse)").unwrap();
+            v.add("what-it-is-not", "Operating envelope",
+                  what_it_is_not.trim().len() >= 30 && refuses.is_match(what_it_is_not), true,
+                  "Name the conditions where the check refuses.");
+            v.add("anomaly", "Anomaly profile", false, false,
+                  "Legacy manifest has no programmable profile. It installs as Ungated; re-author as v2 to be listed.");
+        }
 
         let citations = arr(j, "citations");
         v.add("citations", "Citations",
@@ -299,6 +346,7 @@ impl Vial {
                 .unwrap_or(false)
         });
         let entry_re = Regex::new(r"(?i)^[a-z0-9][a-z0-9._-]*\.html$").unwrap();
+        let v2 = j.get("anomaly").is_some();
         for (key, label, spec) in &ui_specs {
             v.add(&format!("{key}-runtime"), &format!("{label} runtime"),
                   spec.get("runtime").and_then(Value::as_str) == Some("sandbox/1"), true,
@@ -308,7 +356,7 @@ impl Vial {
             v.add(&format!("{key}-entry"), &format!("{label} entry"), entry_ok, true,
                   "Use a relative .html filename beside the manifest; no paths, schemes, or query strings.");
             if entry_ok {
-                v.add_asset(&format!("{key}-asset"), &format!("{label} asset"), self.dir().join(&entry), programmable_any);
+                v.add_asset(&format!("{key}-asset"), &format!("{label} asset"), self.dir().join(&entry), programmable_any, v2);
             }
         }
 
@@ -322,7 +370,7 @@ impl Vial {
         }
 
         // Placeholders are refused: a scaffold must not be publishable as-is.
-        let placeholder = Regex::new(r"(?i)\b(?:REPLACE ME|TODO:|FIXME|yourname)\b").unwrap();
+        let placeholder = Regex::new(r"(?i)REPLACE ME|TODO|TBD|FIXME|yourname|your-handle|example\.(?:com|org|net)").unwrap();
         match placeholder.find(&policy_text) {
             Some(m) => v.add("placeholder", "No placeholder text", false, true,
                 format!("Replace the placeholder text (\"{}\") before validating.", m.as_str())),
@@ -351,13 +399,54 @@ impl Vial {
         v
     }
 
+    /// sha256 of every UI asset the manifest declares, keyed by filename.
+    /// The host verifies each fetched asset against the registry, so a
+    /// manifest hash alone cannot cover a swapped ui.html.
+    pub fn asset_hashes(&self) -> Value {
+        let mut assets = serde_json::Map::new();
+        for key in ["ui", "homeUi"] {
+            let Some(entry) = self.json.get(key).and_then(|v| v.get("entry")).and_then(Value::as_str) else { continue; };
+            let path = self.dir().join(entry);
+            if let Ok(bytes) = std::fs::read(&path) {
+                let digest = Sha256::digest(&bytes);
+                let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                assets.insert(entry.to_string(), Value::String(hex));
+            }
+        }
+        Value::Object(assets)
+    }
+
+    /// sha256 of every declared fixture. The host does not execute fixtures at
+    /// runtime; these pins record the evidence claim a reviewer checked.
+    pub fn fixture_hashes(&self) -> Value {
+        let mut fixtures = serde_json::Map::new();
+        let Some(entries) = self.evidence().and_then(|e| e.get("fixtures")).and_then(Value::as_array) else {
+            return Value::Object(fixtures);
+        };
+        for fixture in entries {
+            let Some(file) = fixture.get("file").and_then(Value::as_str) else { continue; };
+            if !file.starts_with("fixtures/") || file.contains("..") { continue; }
+            if let Ok(bytes) = std::fs::read(self.dir().join(file)) {
+                let digest = Sha256::digest(&bytes);
+                let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                fixtures.insert(file.to_string(), Value::String(hex));
+            }
+        }
+        Value::Object(fixtures)
+    }
+
     /// The registry entry an author pastes into `opensmell-web/public/vials/registry.json`.
     pub fn registry_entry(&self, repo: &str, branch: &str, evidence: Option<&str>) -> Result<Value, String> {
         let (owner, name) = parse_github_repo(repo)
             .ok_or("--repo must be a GitHub repository URL, for example https://github.com/owner/repo")?;
         let manifest_url = format!("https://raw.githubusercontent.com/{owner}/{name}/{branch}/vial.json");
         let source_url = format!("https://github.com/{owner}/{name}");
+        let evidence = evidence
+            .map(str::to_string)
+            .or_else(|| self.evidence().and_then(|e| e.get("grade")).and_then(Value::as_str).map(str::to_string));
+        let assets = self.asset_hashes();
         Ok(serde_json::json!({
+            "schema": self.str("schema"),
             "id": self.id(),
             "name": self.name(),
             "version": self.version(),
@@ -371,13 +460,15 @@ impl Vial {
             "manifestUrl": manifest_url,
             "sourceUrl": source_url,
             "hash": self.sha256_hex(),
+            "assets": assets,
+            "fixtures": self.fixture_hashes(),
             "install": "Install from source above, or paste the manifest URL in Osmograph → Vials → Aromatory."
         }))
     }
 }
 
 impl Validation {
-    fn add_asset(&mut self, id: &str, label: &str, path: PathBuf, programmable_any: bool) {
+    fn add_asset(&mut self, id: &str, label: &str, path: PathBuf, programmable_any: bool, v2: bool) {
         let body = match std::fs::read_to_string(&path) {
             Ok(b) => b,
             Err(e) => {
@@ -416,11 +507,24 @@ impl Validation {
               });
         let live = body.contains("onData");
         self.add(&format!("{id}-live"), &format!("{label} live data"), live, false,
-              if live { "Listens to host data." } else { "The UI never calls osmograph.onData — it is decoration, not a measurement surface." });
-        let programmable = body.contains("setTransforms") || body.contains("setTrajectory");
+              if live { "Listens to host data." } else { "The UI never calls osmograph.onData; it is a static surface." });
+        if v2 {
+            let legacy: Vec<&str> = ["setDetection", "setTransforms"].into_iter()
+                .filter(|method| body.contains(method))
+                .collect();
+            self.add(&format!("{id}-legacy"), &format!("{label} no legacy overrides"), legacy.is_empty(), true,
+                  if legacy.is_empty() {
+                      "The v2 profile is compiled from the manifest; the UI makes no runtime override.".to_string()
+                  } else {
+                      format!("A v2 UI must not call {}; the profile is compiled from the manifest.", legacy.join(" or "))
+                  });
+        }
+        let programmable = v2 || body.contains("setTransforms") || body.contains("setTrajectory");
         let ok = programmable || programmable_any;
         self.add(&format!("{id}-program"), &format!("{label} programmable"), ok, false,
-              if programmable {
+              if v2 {
+                  "The anomaly profile in the manifest is the program."
+              } else if body.contains("setTransforms") || body.contains("setTrajectory") {
                   "Declares host transforms or a trajectory."
               } else if programmable_any {
                   "No declarations here; the pack declares them in another surface."
@@ -428,6 +532,99 @@ impl Validation {
                   "Declares neither host transforms nor a trajectory; the host cannot compute or persist anything for this pack."
               });
     }
+}
+
+fn number(v: &Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(Value::as_f64)
+}
+
+fn validate_anomaly(j: &Value, v: &mut Validation) {
+    let Some(a) = j.get("anomaly").filter(|x| x.is_object()) else {
+        v.add("anomaly", "Anomaly profile", false, true,
+              "A v2 Vial must declare the anomaly block: baseline, transforms, detection, escalation.");
+        return;
+    };
+    let baseline = a.get("baseline").unwrap_or(&Value::Null);
+    let detection = a.get("detection").unwrap_or(&Value::Null);
+    let escalation = detection.get("escalation").unwrap_or(&Value::Null);
+    let admissibility = a.get("admissibility").unwrap_or(&Value::Null);
+    let mut errors: Vec<String> = Vec::new();
+
+    let warmup = number(baseline, "warmupS").unwrap_or(f64::NAN);
+    if !(0.5..=86400.0).contains(&warmup) { errors.push("baseline.warmupS must be between 0.5 and 86400 seconds.".into()); }
+    let r0 = number(baseline, "r0WindowS").unwrap_or(f64::NAN);
+    if !(0.5..=3600.0).contains(&r0) { errors.push("baseline.r0WindowS must be between 0.5 and 3600 seconds.".into()); }
+    let sensitivity = number(detection, "sensitivity").unwrap_or(f64::NAN);
+    if !(0.1..=10.0).contains(&sensitivity) { errors.push("detection.sensitivity must be between 0.1 and 10.".into()); }
+    let min_channels = number(detection, "minChannels").unwrap_or(f64::NAN);
+    if !(min_channels >= 1.0) || min_channels.fract() != 0.0 { errors.push("detection.minChannels must be an integer of at least 1.".into()); }
+    let level_budget = number(detection, "levelBudget").unwrap_or(0.0);
+    if !(0.0..=12.0).contains(&level_budget) { errors.push("detection.levelBudget must be between 0 and 12 sigma.".into()); }
+    let level_ref = number(detection, "levelRefS").unwrap_or(0.0);
+    if level_ref < 0.0 { errors.push("detection.levelRefS cannot be negative.".into()); }
+    if level_ref > 0.0 && level_budget == 0.0 { errors.push("detection.levelRefS needs a non-zero levelBudget.".into()); }
+    let threshold = number(detection, "alertThreshold").unwrap_or(f64::NAN);
+    if !(0.0..=1.0).contains(&threshold) { errors.push("detection.alertThreshold must be between 0 and 1.".into()); }
+    let warning = number(escalation, "warningS").unwrap_or(f64::NAN);
+    let critical = number(escalation, "criticalS").unwrap_or(f64::NAN);
+    let emergency = number(escalation, "emergencyS").unwrap_or(f64::NAN);
+    let reset = number(escalation, "resetNormalS").unwrap_or(f64::NAN);
+    if !(warning > 0.0) { errors.push("detection.escalation.warningS must be positive.".into()); }
+    if !(critical >= warning) { errors.push("detection.escalation.criticalS must be at least warningS.".into()); }
+    if !(emergency >= critical) { errors.push("detection.escalation.emergencyS must be at least criticalS.".into()); }
+    if !(reset > 0.0) { errors.push("detection.escalation.resetNormalS must be positive.".into()); }
+    let hysteresis = number(detection, "hysteresis").unwrap_or(0.0);
+    if !(0.0..=0.95).contains(&hysteresis) { errors.push("detection.hysteresis must be between 0 and 0.95.".into()); }
+    if let Some(far) = number(detection, "farTargetPerMonth") {
+        if far < 0.0 { errors.push("detection.farTargetPerMonth cannot be negative.".into()); }
+    }
+    if let Some(limits) = detection.get("perChannelLimits").and_then(Value::as_object) {
+        let key_re = Regex::new(r"^[a-z0-9][a-z0-9_-]{0,47}$").unwrap();
+        for (key, raw) in limits {
+            if !key_re.is_match(key) { errors.push(format!("detection.perChannelLimits has an invalid channel id: {key}.")); }
+            if !raw.as_f64().map(|n| n > 0.0).unwrap_or(false) {
+                errors.push(format!("detection.perChannelLimits.{key} must be greater than zero."));
+            }
+        }
+    }
+    let coverage = number(admissibility, "minCoverage").unwrap_or(0.8);
+    if !(0.0..=1.0).contains(&coverage) { errors.push("admissibility.minCoverage must be between 0 and 1.".into()); }
+
+    v.add("anomaly", "Anomaly profile", true, true, "Baseline, transforms, detection, and escalation are declared.");
+    v.add("anomaly-values", "Profile values", errors.is_empty(), true,
+          errors.first().cloned().unwrap_or_else(|| "Profile values are in range.".into()));
+}
+
+fn validate_evidence(j: &Value, v: &mut Validation) {
+    let Some(e) = j.get("evidence").filter(|x| x.is_object()) else {
+        v.add("evidence", "Held-out evidence", false, true,
+              "A v2 Vial needs an evidence block with a report URL, the dataset, and measured numbers.");
+        return;
+    };
+    let report = text(e, "reportUrl");
+    let dataset = text(e, "dataset");
+    let metrics = e.get("metrics").unwrap_or(&Value::Null);
+    let has_number = ["farPerMonth", "latencyS", "mde", "nSamples", "nAlarms"]
+        .iter().any(|k| number(metrics, k).map(|n| n.is_finite()).unwrap_or(false));
+    v.add("evidence", "Held-out evidence",
+          report.starts_with("https://") && dataset.trim().len() >= 10 && has_number, true,
+          "A v2 Vial needs an https evidence report, the dataset it describes, and at least one measured number.");
+    let measured = text(e, "measuredAt");
+    v.add("evidence-date", "Evidence date",
+          Regex::new(r"^\d{4}-\d{2}-\d{2}").unwrap().is_match(&measured), false,
+          if measured.is_empty() { "Add the measurement date.".into() } else { format!("Measured {measured}.") });
+    let fixtures = arr(e, "fixtures");
+    let file_re = Regex::new(r"^fixtures/[a-z0-9][a-z0-9._-]*\.json$").unwrap();
+    let bad = fixtures.iter().any(|f| !file_re.is_match(&text(f, "file")));
+    v.add("evidence-fixtures", "Declarative fixtures",
+          !fixtures.is_empty() && !bad, false,
+          if fixtures.is_empty() {
+              "No fixtures declared; `noses test` can only check the static surface.".into()
+          } else if bad {
+              "Fixture path must be fixtures/<name>.json.".into()
+          } else {
+              format!("{} fixture(s).", fixtures.len())
+          });
 }
 
 fn in_range(s: &str, min: usize, max: usize) -> bool {
@@ -565,7 +762,7 @@ mod tests {
         vial.json["whatItIsNot"] = Value::String("It tells you everything.".into());
         let v = vial.validate();
         assert!(!v.passed());
-        assert!(v.errors.iter().any(|e| e.contains("refuse to make")));
+        assert!(v.errors.iter().any(|e| e.contains("refuses")));
     }
 
     #[test]

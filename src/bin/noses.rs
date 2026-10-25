@@ -1,7 +1,8 @@
 //! `noses` — author, validate, test and publish Osmograph Vials.
 //!
-//! One format: `vial.json` (`osmograph.domain-pack/1`) plus optional sandboxed
-//! HTML fragments beside it. The loop is `new` → `lint` → `test` → `publish`.
+//! One format: `vial.json` (`osmograph.domain-pack/2`, `/1` accepted as legacy)
+//! plus optional sandboxed HTML fragments beside it. The loop is
+//! `new` → `lint` → `test` → `publish`.
 //!
 //! The desktop host is the authority: it re-runs the same gate when a manifest
 //! is installed from a URL or a file, and the sandbox is the execution boundary.
@@ -11,7 +12,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use opensmell::vial::{scaffold, Vial};
+use opensmell::vial::{run_fixture, scaffold, Vial};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -75,9 +76,10 @@ fn cmd_new(args: &[String]) -> Result<ExitCode, String> {
     let dir = scaffold::create(&name, &publisher, &domain, &cwd)?;
     println!("Created {}", dir.display());
     println!();
-    println!("Two gaps are deliberate — `noses lint` refuses until you fill them:");
+    println!("Three gaps are deliberate — `noses lint` refuses until you fill them:");
     println!("  1. citations is empty: add the real references behind your protocol.");
-    println!("  2. the text carries REPLACE ME markers: write what this Vial is and is not.");
+    println!("  2. the text carries REPLACE ME markers: write the scope and operating envelope.");
+    println!("  3. evidence is empty: record the held-out report, dataset, and metrics.");
     println!();
     println!("Next:");
     println!("  cd {} && noses lint", dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
@@ -112,7 +114,56 @@ fn cmd_test(args: &[String]) -> Result<ExitCode, String> {
     let path = resolve(positional(args));
     let vial = Vial::load(&path)?;
     println!("Testing {}\n", vial.path.display());
-    let ok = print_validation(&vial);
+    let mut ok = print_validation(&vial);
+
+    println!();
+    println!("Profile fixtures (deterministic, no hardware)");
+    let fixtures = vial
+        .json
+        .get("evidence")
+        .and_then(|e| e.get("fixtures"))
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if fixtures.is_empty() {
+        println!("  · no fixtures declared; `noses test` can only check the static surface.");
+        println!("    Add evidence.fixtures so the profile's persistence, hysteresis, and");
+        println!("    escalation are actually exercised.");
+    } else {
+        for fixture in &fixtures {
+            let id = fixture.get("id").and_then(|v| v.as_str()).unwrap_or("(unnamed)");
+            let file = fixture.get("file").and_then(|v| v.as_str()).unwrap_or("");
+            let declared = fixture.get("expect").and_then(|v| v.as_str()).unwrap_or("");
+            match run_fixture(&vial.json, vial.dir(), file) {
+                Ok(outcome) => {
+                    let mut problems = outcome.problems.clone();
+                    if !declared.is_empty() && outcome.result.final_state != declared {
+                        problems.push(format!(
+                            "manifest declares expect `{declared}` but the fixture ended at `{}`",
+                            outcome.result.final_state
+                        ));
+                    }
+                    if problems.is_empty() {
+                        println!(
+                            "  ✓ {id:<24} {file} → {} ({} alert(s))",
+                            outcome.result.final_state,
+                            outcome.result.alerts.len()
+                        );
+                    } else {
+                        ok = false;
+                        println!("  ✗ {id:<24} {file}");
+                        for problem in problems {
+                            println!("      {problem}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    ok = false;
+                    println!("  ✗ {id:<24} {file}: {error}");
+                }
+            }
+        }
+    }
 
     println!();
     println!("Programmable surface (static, no hardware)");
@@ -136,9 +187,9 @@ fn cmd_test(args: &[String]) -> Result<ExitCode, String> {
         println!("    setDetection     {}", yes_no(has("setDetection")));
     }
     println!();
-    println!("Static checks only. The live proof is the app: install this Vial, arm the");
-    println!("watch on a connected rig, and confirm the host reports the transforms and");
-    println!("the trajectory it actually applied.");
+    println!("Fixtures prove the declared profile state machine. The live proof is the");
+    println!("app: install this Vial, open it on a connected rig, and confirm the");
+    println!("host reports the transforms, alerts, and trajectory it actually applied.");
     Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
 
@@ -184,8 +235,9 @@ fn cmd_publish(args: &[String]) -> Result<ExitCode, String> {
     println!("  1. push this directory to {repo} (the manifest must be at the repo root);");
     println!("  2. verify the raw manifest URL returns exactly these bytes:");
     println!("     {}", entry["manifestUrl"].as_str().unwrap_or(""));
-    println!("  3. open a PR that adds the entry above. A listing is discovery, not a review:");
-    println!("     every install re-runs this gate and every UI runs in the same sandbox.");
+    println!("  3. submit the manifest URL through /appstore. A reviewer approves it in");
+    println!("     /admin. The registry pins the manifest, every UI asset, and every declared");
+    println!("     fixture. Every install re-runs this gate and every UI runs in the same sandbox.");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -196,13 +248,15 @@ fn print_help() {
 USAGE:\n\
   noses new <Name> [--publisher <handle>] [--domain <domain>]  scaffold a real Vial\n\
   noses lint [path]                                            the policy gate, locally\n\
-  noses test [path]                                            lint + what the UI declares\n\
-  noses publish [path] --repo <github-url> [--branch main]     hash + registry entry\n\
+  noses test [path]                                            lint + fixtures + UI surface\n\
+  noses publish [path] --repo <github-url> [--branch main]     hashes + registry entry\n\
   noses help | version\n\
 \n\
-A Vial is one `vial.json` (osmograph.domain-pack/1) plus optional sandboxed\n\
-HTML fragments beside it. The desktop host re-runs the same gate at install and\n\
-is the authority. Nothing here signs or uploads anything.\n\
+A Vial is one `vial.json` (osmograph.domain-pack/2) plus optional sandboxed\n\
+HTML fragments beside it. The profile declares the anomaly program, the UI\n\
+declares the domain surface, and the evidence block holds the held-out report\n\
+and fixtures. The desktop host re-runs the same gate at install and is the\n\
+authority. Nothing here signs or uploads anything.\n\
 \n\
 Docs + LLM index: https://opensmell.org/llms.txt"
     );

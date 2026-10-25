@@ -59,6 +59,46 @@ pub struct DetectionConfig {
     /// Parameter walk noise per channel (how fast drift is absorbed) for the engine.
     #[serde(default = "default_q_param")]
     pub q_param: f64,
+    /// Wall-clock seconds of warm-up before the baseline is trusted. A profile
+    /// may stretch this for slow processes (fermentation, soil) or shorten it
+    /// for a fast bench assay. The engine still refuses to score until the
+    /// baseline has calibrated.
+    #[serde(default = "default_warmup_s")]
+    pub warmup_s: f64,
+    /// Wall-clock seconds of continuous anomaly before warning. This is the
+    /// profile's persistence lever: a transient spike shorter than this never
+    /// becomes an alert.
+    #[serde(default = "default_warning_s")]
+    pub warning_s: f64,
+    /// Wall-clock seconds of continuous anomaly before critical.
+    #[serde(default = "default_critical_s")]
+    pub critical_s: f64,
+    /// Wall-clock seconds of continuous anomaly before emergency.
+    #[serde(default = "default_emergency_s")]
+    pub emergency_s: f64,
+    /// Wall-clock seconds of continuous normal readings before a raised alert
+    /// clears. The profile owns this, so a slow process can stay latched longer
+    /// than the leak preset.
+    #[serde(default = "default_reset_normal_s")]
+    pub reset_normal_s: f64,
+    /// Hysteresis fraction (0..0.95). Zero clears on the normal timer alone.
+    /// Above zero, the reading must also fall to `(1 - hysteresis)` of the
+    /// peak deviation that raised the alarm before the level can clear. This
+    /// stops a signal hovering at the threshold from chattering.
+    #[serde(default)]
+    pub hysteresis: f64,
+    /// Minimum number of channels that must clear their budget before the
+    /// engine trusts a multivariate claim. `1` preserves the legacy verdict;
+    /// `2+` demands corroboration.
+    #[serde(default = "default_min_channels")]
+    pub min_channels: usize,
+    /// Level-anchored threshold in calibrated sigma. `0` disables the level leg.
+    #[serde(default)]
+    pub level_budget: f64,
+    /// Rolling reference seconds for the level leg. `0` uses the fixed
+    /// calibration baseline.
+    #[serde(default)]
+    pub level_ref_s: f64,
 }
 
 fn default_use_ukf() -> bool {
@@ -69,6 +109,24 @@ fn default_q_state() -> f64 {
 }
 fn default_q_param() -> f64 {
     1e-6
+}
+fn default_warmup_s() -> f64 {
+    WARMUP_SECONDS
+}
+fn default_warning_s() -> f64 {
+    WARNING_SECONDS
+}
+fn default_critical_s() -> f64 {
+    CRITICAL_SECONDS
+}
+fn default_emergency_s() -> f64 {
+    EMERGENCY_SECONDS
+}
+fn default_reset_normal_s() -> f64 {
+    RESET_NORMAL_SECONDS
+}
+fn default_min_channels() -> usize {
+    1
 }
 
 impl Default for DetectionConfig {
@@ -81,6 +139,15 @@ impl Default for DetectionConfig {
             use_ukf: true,
             q_state: 1e-3,
             q_param: 1e-6,
+            warmup_s: WARMUP_SECONDS,
+            warning_s: WARNING_SECONDS,
+            critical_s: CRITICAL_SECONDS,
+            emergency_s: EMERGENCY_SECONDS,
+            reset_normal_s: RESET_NORMAL_SECONDS,
+            hysteresis: 0.0,
+            min_channels: 1,
+            level_budget: 0.0,
+            level_ref_s: 0.0,
         }
     }
 }
@@ -659,6 +726,10 @@ pub struct FailSafeSystem {
     /// True once a baseline has been established (explicit calibration or a
     /// completed warm-up buffer). Detection is suppressed until this is set.
     pub baseline_ready: bool,
+    /// Peak per-channel deviation (sigma) observed during the current raised
+    /// alert, used by the profile's hysteresis lever. Reset when the alert
+    /// clears.
+    pub alarm_peak_z: f64,
     /// Operator-tunable detection behaviour, shared by the engine.
     pub config: DetectionConfig,
 }
@@ -709,6 +780,7 @@ impl FailSafeSystem {
             baseline_samples: Vec::new(),
             warmup_time: 0.0,
             baseline_ready: false,
+            alarm_peak_z: 0.0,
             config: DetectionConfig::default(),
         };
         s.propagate_config();
@@ -745,6 +817,9 @@ impl FailSafeSystem {
         ec.sensitivity = self.config.sensitivity;
         ec.q_state = self.config.q_state;
         ec.q_param = self.config.q_param;
+        ec.min_channels = self.config.min_channels.max(1);
+        ec.level_budget = self.config.level_budget.max(0.0);
+        ec.level_ref_s = self.config.level_ref_s.max(0.0);
         ec.state_filter = if self.config.use_ukf {
             StateFilterKind::Unscented
         } else {
@@ -797,14 +872,15 @@ impl FailSafeSystem {
         ambient: Option<AmbientReading>,
         dt_s: f64,
     ) -> Result<FailSafeResult> {
-        // Warm-up: buffer readings for the first WARMUP_SECONDS (wall-clock) of
-        // the stream, then calibrate the engine — the same physical settling
+        // Warm-up: buffer readings for the profile's warm-up window
+        // (wall-clock), then calibrate the engine — the same physical settling
         // window the anomaly engine itself uses across cadences. Until then,
         // report "warming up" and never anomaly.
+        let warmup_s = self.config.warmup_s.max(1e-3);
         if !self.baseline_ready {
             if self.engine.is_calibrated() {
                 self.baseline_ready = true;
-            } else if self.baseline_samples.is_empty() || self.warmup_time < WARMUP_SECONDS {
+            } else if self.baseline_samples.is_empty() || self.warmup_time < warmup_s {
                 self.baseline_samples.push(reading.to_vec());
                 self.warmup_time += dt_s;
                 // Calibrate as soon as a full warm-up window has elapsed. A
@@ -813,7 +889,7 @@ impl FailSafeSystem {
                 // a broken baseline makes every sample "anomalous" — an alarm
                 // storm. Stay in warm-up and retry on the next window instead.
                 if !self.engine.is_calibrated()
-                    && self.warmup_time + 1e-9 >= WARMUP_SECONDS
+                    && self.warmup_time + 1e-9 >= warmup_s
                     && self.baseline_samples.len() >= 2
                 {
                     let samples = std::mem::take(&mut self.baseline_samples);
@@ -873,11 +949,12 @@ impl FailSafeSystem {
             self.consecutive_normal = 0;
             self.anomalous_seconds += dt_s;
             self.normal_seconds = 0.0;
-            self.alert_level = if self.anomalous_seconds + 1e-9 >= EMERGENCY_SECONDS {
+            self.alarm_peak_z = self.alarm_peak_z.max(verdict.max_z);
+            self.alert_level = if self.anomalous_seconds + 1e-9 >= self.config.emergency_s {
                 3  // Emergency
-            } else if self.anomalous_seconds + 1e-9 >= CRITICAL_SECONDS {
+            } else if self.anomalous_seconds + 1e-9 >= self.config.critical_s {
                 2  // Critical
-            } else if self.anomalous_seconds + 1e-9 >= WARNING_SECONDS {
+            } else if self.anomalous_seconds + 1e-9 >= self.config.warning_s {
                 1  // Warning
             } else {
                 self.alert_level
@@ -887,8 +964,16 @@ impl FailSafeSystem {
             self.consecutive_anomalies = 0;
             self.normal_seconds += dt_s;
             self.anomalous_seconds = 0.0;
-            if self.normal_seconds + 1e-9 >= RESET_NORMAL_SECONDS {
+            // Hysteresis: when the profile declares it, a reading must also
+            // fall below a fraction of the peak that raised the alarm before
+            // the level can clear. Zero preserves the legacy timer-only clear.
+            let hysteresis = self.config.hysteresis.clamp(0.0, 0.95);
+            let below_peak = hysteresis <= 0.0
+                || self.alarm_peak_z <= 0.0
+                || verdict.max_z <= (1.0 - hysteresis) * self.alarm_peak_z;
+            if self.normal_seconds + 1e-9 >= self.config.reset_normal_s && below_peak {
                 self.alert_level = 0;
+                self.alarm_peak_z = 0.0;
             }
         }
         if service_alert && self.alert_level < 2 {
@@ -954,7 +1039,7 @@ impl FailSafeSystem {
             sensor_failures: Vec::new(),
             degraded_sensors: Vec::new(),
             warming_up: true,
-            baseline_progress: (self.warmup_time / WARMUP_SECONDS).clamp(0.0, 1.0),
+            baseline_progress: (self.warmup_time / self.config.warmup_s.max(1e-3)).clamp(0.0, 1.0),
             smoothed: reading.to_vec(),
             typology: None,
             regime_switch: false,
