@@ -1,9 +1,9 @@
 //! `noses new` — scaffold a real, programmable Vial.
 //!
-//! The scaffold is deliberately incomplete in exactly two places: it has no
-//! citations and it carries `REPLACE ME` markers. Both are errors in the gate,
-//! so `noses lint` refuses until the author writes real text. A scaffold that
-//! already passed would be a publishable placeholder.
+//! The scaffold is deliberately incomplete where the author must supply real
+//! claims and evidence: citations, text, a held-out report, a rig-specific
+//! per-channel limit, and a fixture. The gate refuses until those are real. A
+//! scaffold that already passed would be a publishable placeholder.
 
 use std::path::{Path, PathBuf};
 
@@ -205,6 +205,7 @@ fn readme(name: &str, id: &str) -> String {
 |---|---|
 | `vial.json` | The manifest (`osmograph.domain-pack/2`): profile, UI, and evidence. The host re-runs this gate at install. |
 | `ui.html` | A sandboxed body fragment. No network, no storage, no Tauri, no external files. |
+| `fixtures/*.json` | You add these: declarative cases that prove the profile's states. |
 | `README.md` | This file. |
 
 ## The loop
@@ -215,10 +216,12 @@ noses test      # lint + profile fixtures + what the UI declares
 noses publish   # sha256 + asset hashes + the registry entry
 ```
 
-`noses new` leaves **three deliberate gaps**: `citations` is empty, the text
-carries `REPLACE ME` markers, and the evidence block has no report yet. All
-three are errors in the gate, so `lint` refuses until you write real text and
-record real evidence. A scaffold is a starting point, never a publishable
+`noses new` leaves the claims and evidence to you: `citations` is empty, the
+text carries `REPLACE ME` markers, the evidence block has no report, and the
+profile has no rig-specific limit or fixture. Those are gate errors, so `lint`
+refuses until you write real text, record real evidence, measure a clean
+baseline on your array, set a per-channel limit, and add a fixture that proves
+the change you claim. A scaffold is a starting point, never a publishable
 placeholder.
 
 ## What the host owns
@@ -232,19 +235,23 @@ placeholder.
 
 Your UI receives a typed snapshot (`payload.snapshot`) and a bounded series
 window (`payload.series`). It never gets raw buffers and never owns the
-detector. The suggested watch limit in the scaffold is `4 × measured cv`; it is
-a starting point derived from the rig's own noise, not a claim about the sample.
+detector. Set `detection.perChannelLimits` from your own measured baseline; a
+limit derived from the rig's noise is a starting point, not a claim about the
+sample. An empty map uses the engine alone and cannot be simulated, so it is
+not Gated.
 
 ## Ship it
 
 1. Push this directory to a public GitHub repository.
 2. `noses publish --repo https://github.com/<you>/<repo>` prints the hash and
    the registry entry.
-3. Open a PR against `OpenSmell/OpenSmell-web` that adds the entry to
-   `public/vials/registry.json`.
+3. Submit the manifest URL at https://www.opensmell.xyz/appstore. A reviewer
+   approves it in `/admin`; the registry entry is committed and the next
+   Aromatory open sees it.
 
-A listing is discovery, not a review. The host runs the same gate on every
-install, and every UI runs in the same sandbox.
+A listing records a human review of the claim and its evidence. The host still
+runs the gate and verifies the pinned manifest and UI bytes on every install,
+and every UI runs in the same sandbox.
 
 ## Two live examples
 
