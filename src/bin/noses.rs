@@ -76,10 +76,11 @@ fn cmd_new(args: &[String]) -> Result<ExitCode, String> {
     let dir = scaffold::create(&name, &publisher, &domain, &cwd)?;
     println!("Created {}", dir.display());
     println!();
-    println!("Three gaps are deliberate — `noses lint` refuses until you fill them:");
+    println!("Three gaps are deliberate — `noses lint` reports them until you fill them:");
     println!("  1. citations is empty: add the real references behind your protocol.");
     println!("  2. the text carries REPLACE ME markers: write the scope and operating envelope.");
-    println!("  3. evidence is empty: record the held-out report, dataset, and metrics.");
+    println!("  3. evidence is empty: record the held-out report, dataset, and metrics before `noses publish`.");
+    println!("     Until then the host installs the Vial as Ungated; lint does not pretend otherwise.");
     println!();
     println!("Next:");
     println!("  cd {} && noses lint", dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
@@ -181,7 +182,7 @@ fn cmd_test(args: &[String]) -> Result<ExitCode, String> {
         let body = std::fs::read_to_string(&asset).unwrap_or_default();
         let has = |s: &str| body.contains(s);
         println!("  {key} → {entry}");
-        println!("    onData           {}", yes_no(has("onData")));
+        println!("    host data        {}", yes_no(has("onData") || has("HOST.on(") || has("host.on(")));
         println!("    setTransforms    {}", yes_no(has("setTransforms")));
         println!("    setTrajectory    {}", yes_no(has("setTrajectory")));
         println!("    setDetection     {}", yes_no(has("setDetection")));
@@ -204,6 +205,9 @@ fn cmd_publish(args: &[String]) -> Result<ExitCode, String> {
     let ok = print_validation(&vial);
     if !ok {
         return Err("fix the errors above before publishing".into());
+    }
+    if !vial.json.get("evidence").map(|e| e.is_object()).unwrap_or(false) {
+        return Err("publishing to the Aromatory requires an evidence block with a report URL, the dataset, and measured numbers; without it the Vial stays Ungated".into());
     }
     let repo = flag(args, "repo").ok_or(
         "publish needs --repo https://github.com/<owner>/<repo> so the registry entry has real URLs")?;

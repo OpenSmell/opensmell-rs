@@ -597,8 +597,10 @@ fn validate_anomaly(j: &Value, v: &mut Validation) {
 
 fn validate_evidence(j: &Value, v: &mut Validation) {
     let Some(e) = j.get("evidence").filter(|x| x.is_object()) else {
-        v.add("evidence", "Held-out evidence", false, true,
-              "A v2 Vial needs an evidence block with a report URL, the dataset, and measured numbers.");
+        // The host installs a v2 without evidence as Ungated. Lint and test
+        // must agree; publish (the listing path) requires the block instead.
+        v.add("evidence", "Held-out evidence", false, false,
+              "No evidence block declared; this Vial installs as Ungated and cannot be listed.");
         return;
     };
     let report = text(e, "reportUrl");
