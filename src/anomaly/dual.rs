@@ -401,6 +401,12 @@ pub struct EngineVerdict {
     pub raw_score: f64,
     pub max_z: f64,
     pub z_scores: Vec<f64>,
+    /// Channels that cleared the sensitivity-scaled *sensitive* budget. This is
+    /// the corroboration count the profile's `min_channels` gate uses; it is
+    /// deliberately separate from `triggered_channels`, which only reports the
+    /// lower `z_min` diagnostic threshold.
+    #[serde(default)]
+    pub corroborated_channels: usize,
     pub triggered_channels: Vec<usize>,
     /// Platt-calibrated probability that this reading is a real change.
     pub confidence: f64,
@@ -824,6 +830,7 @@ impl DualKalmanEngine {
             raw_score: 0.0,
             max_z: 0.0,
             z_scores: vec![0.0; self.n_channels],
+            corroborated_channels: 0,
             triggered_channels: Vec::new(),
             confidence: 0.0,
             threshold_confidence: self.threshold_confidence_for(self.n_samples),
@@ -1285,6 +1292,7 @@ impl DualKalmanEngine {
             raw_score,
             max_z,
             z_scores,
+            corroborated_channels: channels_past,
             triggered_channels: triggered,
             confidence,
             threshold_confidence,

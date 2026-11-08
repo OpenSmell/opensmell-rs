@@ -906,24 +906,35 @@ impl FailSafeSystem {
 
         let verdict: EngineVerdict = self.engine.detect_with_dt(reading, ambient, dt_s)?;
 
-        // Consensus on the engine's three false-positive budgets.
+        // The engine already applied the profile's corroboration floor
+        // (`min_channels`) and its optional level-anchored leg. Do not recompute
+        // the verdict from raw budget votes here: that would discard both gates
+        // and make a profile's `min_channels` decorative.
         let anomaly_votes = verdict.anomaly_votes;
-        let mut is_anomaly = anomaly_votes >= 2;
+        let min_channels = self.config.min_channels.max(1);
+        let corroborated = verdict.corroborated_channels >= min_channels;
+        let mut is_anomaly = verdict.is_anomaly;
 
         // Confidence override: a strong multivariate deviation (Platt confidence
         // on the innovation Mahalanobis) can fire with a single budget, but only
-        // when at least one per-channel innovation also moved.
+        // when the profile's corroboration floor is still satisfied.
         let max_confidence = verdict.confidence;
-        if anomaly_votes >= 1 && max_confidence > 0.9 && verdict.max_z > 0.5 {
+        if !is_anomaly
+            && anomaly_votes >= 1
+            && max_confidence > 0.9
+            && verdict.max_z > 0.5
+            && corroborated
+        {
             is_anomaly = true;
         }
 
-        // Sensor health check: if any sensor is degraded, a single budget suffices.
+        // Sensor health check: if any sensor is degraded, a single budget
+        // suffices, but never below the profile's corroboration floor.
         let degraded_sensors: Vec<usize> = self.sensor_health.iter().enumerate()
             .filter(|(_, &h)| h < 0.5)
             .map(|(i, _)| i)
             .collect();
-        if !degraded_sensors.is_empty() {
+        if !degraded_sensors.is_empty() && corroborated {
             is_anomaly = anomaly_votes >= 1;
         }
 
@@ -1600,6 +1611,62 @@ mod tests {
         assert!(!frozen.detect(&[1.0, 2.0]).unwrap().is_anomaly);
         let r = frozen.detect(&[4.0, 5.0]).unwrap();
         assert!(r.is_anomaly, "without drift tracking the same shift should alarm");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_profile_min_channels_is_enforced_on_live_path() {
+        let baseline: Vec<Vec<f64>> = (0..80)
+            .map(|i| {
+                let n = i as f64;
+                vec![
+                    1.0 + 0.03 * (n * 1.7).sin(),
+                    2.0 + 0.03 * (n * 1.7).sin(),
+                    3.0 + 0.03 * (n * 1.7).sin(),
+                ]
+            })
+            .collect();
+        let mk = || {
+            let mut s = FailSafeSystem::new(3);
+            s.set_config(DetectionConfig {
+                smoothing_alpha: 1.0,
+                drift_alpha: 0.0,
+                sensitivity: 1.0,
+                q_state: 1e-4,
+                q_param: 0.0,
+                min_channels: 2,
+                ..DetectionConfig::default()
+            });
+            s.calibrate_baseline(&baseline).unwrap();
+            s
+        };
+
+        let mut single = mk();
+        for _ in 0..30 {
+            let _ = single.detect(&[1.0, 2.0, 3.0]).unwrap();
+        }
+        let one = single.detect(&[5.0, 2.0, 3.0]).unwrap();
+        assert!(
+            !one.is_anomaly,
+            "one channel must not satisfy min_channels=2 (votes {})",
+            one.anomaly_votes
+        );
+
+        let mut multi = mk();
+        for _ in 0..30 {
+            let _ = multi.detect(&[1.0, 2.0, 3.0]).unwrap();
+        }
+        let two = multi.detect(&[5.0, 6.0, 3.0]).unwrap();
+        assert!(
+            two.is_anomaly,
+            "two channels must satisfy min_channels=2 (votes {})",
+            two.anomaly_votes
+        );
+        assert!(
+            two.calibrated_confidence >= 0.6,
+            "the v0.6 profile's 0.6 confidence floor must not suppress a real two-channel step (confidence {})",
+            two.calibrated_confidence
+        );
     }
 
     #[test]
