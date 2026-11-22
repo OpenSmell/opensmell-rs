@@ -32,6 +32,60 @@ pub enum OpenSmellError {
 
 pub type Result<T> = std::result::Result<T, OpenSmellError>;
 
+/// Sensor type / sensing principle. Mirrors opensmell-js SENSOR_TYPES.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum SensorType {
+    Mox,
+    Electrochemical,
+    Ndir,
+    Pas,
+    Pid,
+    Galvanic,
+    CatalyticBead,
+    Qcm,
+    Saw,
+    Cantilever,
+    Polymer,
+    SolidElectrolyte,
+    PhIsfet,
+    EnvTrh,
+    Mems,
+    Miris,
+    Other,
+    Unknown,
+}
+
+impl Default for SensorType {
+    fn default() -> Self {
+        SensorType::Unknown
+    }
+}
+
+impl std::fmt::Display for SensorType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SensorType::Mox => write!(f, "mox"),
+            SensorType::Electrochemical => write!(f, "electrochemical"),
+            SensorType::Ndir => write!(f, "ndir"),
+            SensorType::Pas => write!(f, "pas"),
+            SensorType::Pid => write!(f, "pid"),
+            SensorType::Galvanic => write!(f, "galvanic"),
+            SensorType::CatalyticBead => write!(f, "catalyticBead"),
+            SensorType::Qcm => write!(f, "qcm"),
+            SensorType::Saw => write!(f, "saw"),
+            SensorType::Cantilever => write!(f, "cantilever"),
+            SensorType::Polymer => write!(f, "polymer"),
+            SensorType::SolidElectrolyte => write!(f, "solidElectrolyte"),
+            SensorType::PhIsfet => write!(f, "phIsfet"),
+            SensorType::EnvTrh => write!(f, "envTrh"),
+            SensorType::Mems => write!(f, "mems"),
+            SensorType::Miris => write!(f, "miris"),
+            SensorType::Other => write!(f, "other"),
+            SensorType::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
 /// A single sensor reading: raw resistance values across N channels.
 #[derive(Debug, Clone)]
 pub struct SensorReading {
